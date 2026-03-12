@@ -1,0 +1,6 @@
+playwright>=1.40.0
+gspread>=6.0.0
+google-auth>=2.0.0
+openai>=1.0.0
+sentence-transformers>=2.7.0
+langdetect>=1.0.9

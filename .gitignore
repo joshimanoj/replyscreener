@@ -1,0 +1,24 @@
+# Sensitive credentials — never commit these
+google_credentials.json
+credentials.txt
+
+# Browser session — contains login cookies
+browser_profile/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files — run output, not source code
+all_tweets.json
+anchor.json
+collected_tweets.json
+all_tweets_*.xlsx
+filtered_tweets_*.xlsx
+*.xlsx
+
+# Directories with scraped output
+scraped tweets/
+screenshots/

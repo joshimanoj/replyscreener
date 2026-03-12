@@ -1,0 +1,12 @@
+Select if the tweet touches on at least one of these:
+
+1. Mind & behavior — habits, impulses, reactions, patterns, procrastination, anger, anxiety, overthinking, scrolling, decision-making
+2. Self-awareness / introspection — self-observation, inner life, consciousness, awareness, presence
+3. Philosophy applied to life — Stoicism, Buddhism, Taoism, Jungian ideas, Eastern philosophy, ancient wisdom, or any tradition overlapping with Vedic themes
+4. Mental models / frameworks — cognitive biases, psychology, how the mind works
+5. Spirituality & personal growth — identity, ego, desire, attachment, suffering, meaning, purpose
+6. Productivity & motivation — only when framed around why we behave, not just how to optimize
+
+Skip if the tweet is primarily about: 
+
+news, politics, sports, finance, tech trends, entertainment, or personal life updates with no self-reflection angle.

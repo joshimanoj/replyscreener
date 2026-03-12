@@ -1,0 +1,20 @@
+{
+    "scrolling": {
+        "max_tweets": 250,
+        "max_tweets_anchor": 1000,
+        "max_iterations": 150,
+        "scroll_pause_min": 1.5,
+        "scroll_pause_max": 3.5
+    },
+    "filtering": {
+        "semantic_threshold": 0.17
+    },
+    "google_sheets": {
+        "credentials_file": "google_credentials.json",
+        "spreadsheet_id": "16Xkyishy8Jop_xRnRfu_9jDIopdb28-FqA1xv1SMBvk"
+    },
+    "openai": {
+        "model": "gpt-4o-mini",
+        "top_n_replies": 10
+    }
+}

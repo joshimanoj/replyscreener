@@ -402,6 +402,73 @@ def score_tweets_batch(tweets: list[dict], **_) -> None:
         tweet["score"] = keep_score - skip_score
 
 
+# ─── Two-stage filtering ─────────────────────────────────────
+# Stage 1: mpnet pre-filter (loose — only cuts obvious junk)
+# Lower threshold catches tangential but relevant tweets
+PREFILTER_THRESHOLD = 0.3   # was 0.6
+
+RELEVANCE_SYSTEM_PROMPT = """You decide if a tweet is worth replying to from @vedaselfhelp — \
+a handle that bridges Vedic philosophy, Upanishadic wisdom, and modern psychology/self-help.
+
+A tweet is RELEVANT if it touches any of these (explicitly OR implicitly):
+- Human psychology: habits, emotions, anxiety, overthinking, attention, behavior, motivation
+- Inner life: self-awareness, reflection, consciousness, stillness, presence, ego
+- Philosophy: meaning, identity, suffering, acceptance, impermanence, perception, reality
+- Self-development: growth, patterns, beliefs, transformation, discipline, purpose
+- Vedic/Eastern/Western wisdom traditions (Stoic, Buddhist, Taoist, Hindu, Jungian, etc.)
+- The mechanics of the mind: distraction, craving, avoidance, loops, compulsion
+
+A tweet is NOT RELEVANT if it's primarily about:
+- News, politics, sports, markets, celebrity, product promotions
+- Pure life updates with no reflective or philosophical dimension
+- Religious rituals, festival announcements, event schedules
+
+Important: Relevance is about the UNDERLYING THEME, not surface vocabulary.
+A tweet about "why I can't stop doomscrolling" is relevant.
+A tweet quoting Bhagavad Gita but just sharing a festival date is not.
+
+Reply with JSON only: {"relevant": true/false, "reason": "one short sentence"}"""
+
+
+def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
+    """Stage 2: LLM relevance filter for tweets that passed the mpnet pre-filter."""
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+    client = openai.OpenAI(api_key=api_key)
+
+    relevant = []
+    print(f"   🤖 LLM-filtering {len(tweets)} pre-filtered tweets...")
+    for i, tweet in enumerate(tweets, 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
+                    {"role": "user",   "content": f"TWEET: {tweet['text']}"},
+                ],
+                max_tokens=80,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content.strip()
+            result = json.loads(raw)
+            tweet["llm_relevant"] = result.get("relevant", False)
+            tweet["llm_reason"]   = result.get("reason", "")
+            if tweet["llm_relevant"]:
+                relevant.append(tweet)
+                print(f"      [{i}/{len(tweets)}] ✓  {tweet.get('author','?')} — {tweet['llm_reason']}")
+            else:
+                print(f"      [{i}/{len(tweets)}] ✗  {tweet.get('author','?')} — {tweet['llm_reason']}")
+        except Exception as e:
+            # On error, keep the tweet (fail open)
+            tweet["llm_relevant"] = True
+            tweet["llm_reason"]   = f"[filter error: {e}]"
+            relevant.append(tweet)
+            print(f"      [{i}/{len(tweets)}] ?  filter error: {e}")
+    return relevant
+
+
 # ─── Reply guide ──────────────────────────────────────────────
 
 def load_reply_guide() -> str:
@@ -411,7 +478,7 @@ def load_reply_guide() -> str:
 
 # ─── OpenAI reply generation ──────────────────────────────────
 
-def generate_reply(tweet_text: str, reply_guide: str, model: str = "gpt-4o") -> str:
+def generate_reply(tweet_text: str, reply_guide: str, model: str = "gpt-5.4") -> str:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
@@ -597,20 +664,25 @@ async def main():
     else:
         run_tweets = all_list
 
-    threshold = config.get("filtering", {}).get("semantic_threshold", 0.6)
+    model = config.get("openai", {}).get("model", "gpt-5.4")
+
+    # ── Stage 1: mpnet pre-filter (loose) ────────────────────────
+    threshold = config.get("filtering", {}).get("semantic_threshold", PREFILTER_THRESHOLD)
     print(f"\n   🔍 Scoring {len(run_tweets)} tweets from this run...")
-
-    score_tweets_batch(run_tweets, model=config.get("openai", {}).get("model", "gpt-4o-mini"))
-
+    score_tweets_batch(run_tweets)
     save_tweets(all_tweets)  # persist scores
 
-    scored = [t for t in run_tweets if t.get("score", -999) > threshold]
+    prefiltered = [t for t in run_tweets if t.get("score", -999) > threshold]
+    prefiltered.sort(key=lambda t: t["score"], reverse=True)
+    print(f"   🔎 Pre-filter passed: {len(prefiltered)} / {len(run_tweets)} tweets")
+
+    # ── Stage 2: LLM relevance filter ────────────────────────────
+    scored = llm_filter_tweets(prefiltered, model=model)
     scored.sort(key=lambda t: t["score"], reverse=True)
-    print(f"   🎯 Filter matched {len(scored)} / {len(run_tweets)} tweets (sorted by score)")
+    print(f"   🎯 LLM filter matched {len(scored)} / {len(prefiltered)} tweets")
 
     # ── Generate replies for top N ────────────────────────────────
     top_n = config.get("openai", {}).get("top_n_replies", 10)
-    model = config.get("openai", {}).get("model", "gpt-4o-mini")
     top   = scored[:top_n]
 
     if top:

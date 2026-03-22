@@ -14,7 +14,7 @@
         "spreadsheet_id": "16Xkyishy8Jop_xRnRfu_9jDIopdb28-FqA1xv1SMBvk"
     },
     "openai": {
-        "model": "gpt-4o-mini",
+        "model": "gpt-5.4",
         "top_n_replies": 10
     }
 }

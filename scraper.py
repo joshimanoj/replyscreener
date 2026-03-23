@@ -447,7 +447,7 @@ def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
                     {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
                     {"role": "user",   "content": f"TWEET: {tweet['text']}"},
                 ],
-                max_tokens=80,
+                max_completion_tokens=80,
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
@@ -489,7 +489,7 @@ def generate_reply(tweet_text: str, reply_guide: str, model: str = "gpt-5.4") ->
             {"role": "system", "content": reply_guide},
             {"role": "user",   "content": f"TWEET: {tweet_text}"},
         ],
-        max_tokens=300,
+        max_completion_tokens=300,
         temperature=0.7,
     )
     return response.choices[0].message.content.strip()

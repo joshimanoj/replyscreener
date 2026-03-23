@@ -169,6 +169,36 @@ async def read_tweets_from_dom(page) -> list[dict]:
     """)
 
 
+async def wait_for_timeline_ready(page, timeout_ms: int = 120000) -> bool:
+    """
+    Wait until the X home timeline is visibly loaded enough for scraping.
+    Returns True when tweet articles are present, False on timeout.
+    """
+    deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+
+    while asyncio.get_running_loop().time() < deadline:
+        challenge = await check_for_challenge(page)
+        if challenge:
+            print(f"\n   ⚠️  CHALLENGE DETECTED while waiting: '{challenge}'")
+            return False
+
+        try:
+            current_url = page.url
+            if "/login" in current_url or "/i/flow/" in current_url:
+                await asyncio.sleep(2)
+                continue
+
+            tweets = await page.locator('article[data-testid="tweet"]').count()
+            if tweets > 0:
+                return True
+        except Exception:
+            pass
+
+        await asyncio.sleep(2)
+
+    return False
+
+
 # ─── Main Agent Loop ─────────────────────────────────────────
 
 async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
@@ -627,14 +657,18 @@ async def main():
             print("\n" + "=" * 60)
             if PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir()):
                 print("  ✅ Saved session found — you should already be logged in.")
-                print("  Once your timeline is visible, press ENTER to start.")
             else:
                 print("  👋 First run — please log in to Twitter in the browser window.")
-                print("  Once your timeline is visible, press ENTER to start.")
+            print("  Waiting for your home timeline to load automatically.")
             print("=" * 60)
-            input("\n   Press ENTER when ready → ")
 
-            print("\n   ✅ Taking over! Don't touch the browser...\n")
+            if not await wait_for_timeline_ready(page):
+                print("\n   🛑 Timeline did not become ready in time.")
+                print("   👉 Confirm Chrome is logged in and X home is accessible, then re-run.")
+                await context.close()
+                return
+
+            print("\n   ✅ Timeline detected. Taking over...\n")
             await asyncio.sleep(random.uniform(2.5, 4.5))   # human landing pause
 
             new_count, first_tweet = await agent_loop(page, config, all_tweets, anchor)

@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/Users/manojjoshi/Desktop/scraper/run_random_window.sh</string>
+        <string>/Users/manojjoshi/Library/Application Support/replyscreener/run_random_window.sh</string>
         <string>afternoon</string>
     </array>
 
@@ -24,10 +24,10 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/manojjoshi/Desktop/scraper/logs/launchd-afternoon.out.log</string>
+    <string>/Users/manojjoshi/Library/Application Support/replyscreener/logs/launchd-afternoon.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/manojjoshi/Desktop/scraper/logs/launchd-afternoon.err.log</string>
+    <string>/Users/manojjoshi/Library/Application Support/replyscreener/logs/launchd-afternoon.err.log</string>
 
     <key>RunAtLoad</key>
     <false/>

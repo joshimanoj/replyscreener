@@ -8,6 +8,15 @@ WINDOW_NAME="${1:-window}"
 TEST_MODE="${TEST_MODE:-0}"
 TEST_SLEEP_SECONDS="${TEST_SLEEP_SECONDS:-30}"
 DELAY_SECONDS="${DELAY_SECONDS:-}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  if [[ -x "$PROJECT_DIR/venv/bin/python" ]]; then
+    PYTHON_BIN="$PROJECT_DIR/venv/bin/python"
+  else
+    PYTHON_BIN="/usr/bin/env python3"
+  fi
+fi
 
 mkdir -p "$LOG_DIR"
 
@@ -29,7 +38,7 @@ timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] dry-run test finished"
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting scraper"
-    /usr/bin/caffeinate -dimsu /usr/bin/env python3 "$PROJECT_DIR/scraper.py"
+    /usr/bin/caffeinate -dimsu $=PYTHON_BIN "$PROJECT_DIR/scraper.py"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] scraper finished"
   fi
 } >> "$LOG_DIR/${WINDOW_NAME}.log" 2>&1

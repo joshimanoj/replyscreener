@@ -14,9 +14,12 @@ Usage:
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import sys
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -57,6 +60,8 @@ TWEETS_FILE      = SCRIPT_DIR / "all_tweets.json"
 ANCHOR_FILE      = SCRIPT_DIR / "anchor.json"
 REPLY_GUIDE_FILE = SCRIPT_DIR / "tweet_reply_guide"
 PROFILE_DIR      = SCRIPT_DIR / "browser_profile"   # persistent login session
+HANDLE_STATS_FILE = SCRIPT_DIR / "reply_worthy_handles.json"
+RUN_HISTORY_FILE  = SCRIPT_DIR / "run_history.jsonl"
 
 
 # ─── Config ──────────────────────────────────────────────────
@@ -98,6 +103,72 @@ def save_tweets(all_tweets: dict):
         json.dump(list(all_tweets.values()), f, indent=2, ensure_ascii=False)
 
 
+def _normalize_handle(handle: str) -> str:
+    handle = (handle or "").strip()
+    if not handle:
+        return ""
+    return handle if handle.startswith("@") else f"@{handle}"
+
+
+def _handle_url(handle: str) -> str:
+    handle = _normalize_handle(handle)
+    return f"https://x.com/{handle.lstrip('@')}" if handle else ""
+
+
+def load_reply_worthy_handle_stats() -> dict:
+    if not HANDLE_STATS_FILE.exists():
+        return {"handles": {}}
+    with open(HANDLE_STATS_FILE) as f:
+        data = json.load(f)
+    if "handles" not in data:
+        return {"handles": data if isinstance(data, dict) else {}}
+    return data
+
+
+def save_reply_worthy_handle_stats(stats: dict) -> None:
+    stats["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(HANDLE_STATS_FILE, "w") as f:
+        json.dump(stats, f, indent=2, ensure_ascii=False)
+
+
+def append_run_history(record: dict) -> None:
+    record["recorded_at"] = datetime.now(timezone.utc).isoformat()
+    with open(RUN_HISTORY_FILE, "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def record_reply_worthy_handles(tweets: list[dict], stats: dict) -> dict:
+    handles = stats.setdefault("handles", {})
+
+    for tweet in tweets:
+        handle = _normalize_handle(tweet.get("author", ""))
+        if not handle:
+            continue
+
+        entry = handles.setdefault(handle, {
+            "handle": handle,
+            "handle_url": _handle_url(handle),
+            "handle_name": "",
+            "follower_count": "",
+            "reply_worthy_count": 0,
+        })
+        entry["handle"] = handle
+        entry["handle_url"] = _handle_url(handle)
+        entry["handle_name"] = tweet.get("author_name", entry.get("handle_name", ""))
+        entry.setdefault("follower_count", "")
+        entry["reply_worthy_count"] = int(entry.get("reply_worthy_count") or 0) + 1
+
+    return stats
+
+
+def annotate_reply_worthy_batch_handles(tweets: list[dict]) -> None:
+    counts = Counter(_normalize_handle(tweet.get("author", "")) for tweet in tweets)
+    counts.pop("", None)
+    for tweet in tweets:
+        handle = _normalize_handle(tweet.get("author", ""))
+        tweet["reply_worthy_count_this_run"] = counts.get(handle, 0)
+
+
 # ─── Challenge / warning detection ──────────────────────────
 
 CHALLENGE_SIGNALS = [
@@ -108,11 +179,59 @@ CHALLENGE_SIGNALS = [
     "unusual activity",
     "enter your phone",
     "enter your email",
+]
+
+LOGIN_SIGNALS = [
     "start a new session",
     "log in to twitter",
     "log in to x",
     "sign in to x",
 ]
+
+AUTH_COOKIE_NAMES = {
+    "auth_token",
+    "ct0",
+    "twid",
+    "kdt",
+}
+
+def has_saved_x_session() -> bool:
+    """
+    Best-effort check that the persistent profile contains an authenticated X session.
+    A profile directory alone is not enough; guest cookies can exist even when signed out.
+    """
+    cookies_db = PROFILE_DIR / "Default" / "Cookies"
+    if not cookies_db.exists():
+        return False
+
+    try:
+        import sqlite3
+        with sqlite3.connect(f"file:{cookies_db}?mode=ro", uri=True) as con:
+            cur = con.cursor()
+            placeholders = ",".join("?" for _ in AUTH_COOKIE_NAMES)
+            row = cur.execute(
+                f"""
+                select 1
+                from cookies
+                where (host_key like '%.x.com' or host_key like 'x.com'
+                       or host_key like '%.twitter.com' or host_key like 'twitter.com')
+                  and name in ({placeholders})
+                limit 1
+                """,
+                tuple(AUTH_COOKIE_NAMES),
+            ).fetchone()
+            return row is not None
+    except Exception:
+        return False
+
+async def wait_for_manual_login():
+    """
+    Keep the browser open long enough for a first-time or refreshed login.
+    This avoids closing Chrome before the user can complete X's sign-in flow.
+    """
+    print("\n   🔐 No authenticated session detected.")
+    print("   Please log in in the opened Chrome window, then come back here and press Enter.")
+    await asyncio.to_thread(input, "   Press Enter after X is logged in...")
 
 async def check_for_challenge(page) -> str | None:
     """
@@ -129,11 +248,141 @@ async def check_for_challenge(page) -> str | None:
     return None
 
 
+async def check_for_login_required(page) -> str | None:
+    """
+    Returns a short login signal if X is showing a signed-out/login state.
+    This is recoverable and should not be treated like an account challenge.
+    """
+    try:
+        current_url = page.url
+        if "/login" in current_url or "/i/flow/login" in current_url:
+            return "login url"
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        return None
+    for signal in LOGIN_SIGNALS:
+        if signal in body:
+            return signal
+    return None
+
+
 # ─── DOM Tweet Extractor ─────────────────────────────────────
 
 async def read_tweets_from_dom(page) -> list[dict]:
     return await page.evaluate("""
         () => {
+            const parseCount = (raw) => {
+                if (!raw) return null;
+                const text = String(raw).trim().toUpperCase().replace(/,/g, '');
+                const match = text.match(/^([0-9]*\\.?[0-9]+)\\s*([KMB])?$/);
+                if (!match) return null;
+                const value = parseFloat(match[1]);
+                if (Number.isNaN(value)) return null;
+                const multiplier = { K: 1_000, M: 1_000_000, B: 1_000_000_000 };
+                return Math.round(value * (multiplier[match[2]] || 1));
+            };
+
+            const parseCountFromText = (raw) => {
+                if (!raw) return null;
+                const match = String(raw).replace(/,/g, '').match(/([0-9]*\\.?[0-9]+)\\s*([KMB])?/i);
+                return match ? parseCount(`${match[1]}${match[2] || ''}`) : null;
+            };
+
+            const getMetricFromElement = (el, fallbackLabel) => {
+                if (!el) return null;
+
+                const countText =
+                    el.querySelector('[dir="ltr"] > span')?.textContent ||
+                    el.querySelector('span[data-testid="app-text-transition-container"]')?.textContent ||
+                    el.textContent ||
+                    '';
+                const parsed = parseCount(countText);
+                if (parsed !== null) return parsed;
+
+                const parsedFromText = parseCountFromText(countText);
+                if (parsedFromText !== null) return parsedFromText;
+
+                const aria = el.getAttribute('aria-label') || '';
+                if (aria) {
+                    const parsedFromAria = parseCountFromText(aria);
+                    if (parsedFromAria !== null) return parsedFromAria;
+                    if (fallbackLabel && aria.toLowerCase().includes(`0 ${fallbackLabel}`)) {
+                        return 0;
+                    }
+                }
+                return fallbackLabel ? 0 : null;
+            };
+
+            const getMetric = (article, testId, fallbackLabel) => {
+                return getMetricFromElement(article.querySelector(`[data-testid="${testId}"]`), fallbackLabel);
+            };
+
+            const getMetricFromGroupLabel = (article, labels) => {
+                for (const group of article.querySelectorAll('[role="group"][aria-label]')) {
+                    const aria = group.getAttribute('aria-label') || '';
+                    const parts = aria.split(/[,•·]/);
+                    for (const part of parts) {
+                        const lower = part.toLowerCase();
+                        if (labels.some(label => lower.includes(label))) {
+                            const parsed = parseCountFromText(part);
+                            if (parsed !== null) return parsed;
+                        }
+                    }
+                }
+                return null;
+            };
+
+            const getLabeledMetricFromElement = (el, labels) => {
+                if (!el) return null;
+
+                const candidates = [
+                    el.getAttribute('aria-label') || '',
+                    el.textContent || '',
+                ];
+
+                for (const raw of candidates) {
+                    const parts = raw.split(/[,•·\\n]/);
+                    for (const part of parts) {
+                        const lower = part.toLowerCase();
+                        if (labels.some(label => lower.includes(label))) {
+                            const parsed = parseCountFromText(part);
+                            if (parsed !== null) return parsed;
+                        }
+                    }
+                }
+
+                return null;
+            };
+
+            const getImpressions = (article) => {
+                const labels = ['view', 'views', 'impression', 'impressions'];
+                const selectors = [
+                    '[data-testid="analytics"]',
+                    '[aria-label*="view" i]',
+                    '[aria-label*="impression" i]',
+                    '[aria-label*="analytics" i]',
+                    'a[href*="/analytics"]',
+                    'a[href*="/i/tweet_activity"]',
+                ];
+
+                for (const selector of selectors) {
+                    for (const el of article.querySelectorAll(selector)) {
+                        const text = `${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`.toLowerCase();
+                        if (!text.includes('view') && !text.includes('analytics') && !text.includes('impression')) continue;
+
+                        const parsed = getLabeledMetricFromElement(el, labels);
+                        if (parsed !== null) return parsed;
+
+                        if (selector === '[data-testid="analytics"]') {
+                            const fallback = getMetricFromElement(el, null);
+                            if (fallback !== null) return fallback;
+                        }
+                    }
+                }
+
+                return getMetricFromGroupLabel(article, labels);
+            };
+
             const articles = document.querySelectorAll('article[data-testid="tweet"]');
             const results = [];
 
@@ -156,13 +405,27 @@ async def read_tweets_from_dom(page) -> list[dict]:
                 }
 
                 let url = 'unknown';
+                let postedAt = '';
                 const timeEl = article.querySelector('time');
                 if (timeEl) {
+                    postedAt = timeEl.getAttribute('datetime') || '';
                     const a = timeEl.closest('a');
                     if (a) url = 'https://x.com' + a.getAttribute('href');
                 }
 
-                if (text) results.push({ author: handle, author_name: displayName, text, url });
+                if (!text) continue;
+
+                results.push({
+                    author: handle,
+                    author_name: displayName,
+                    text,
+                    url,
+                    posted_at: postedAt,
+                    replies: getMetric(article, 'reply', 'reply'),
+                    retweets: getMetric(article, 'retweet', 'repost'),
+                    likes: getMetric(article, 'like', 'like'),
+                    impressions: getImpressions(article),
+                });
             }
             return results;
         }
@@ -177,6 +440,11 @@ async def wait_for_timeline_ready(page, timeout_ms: int = 120000) -> bool:
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
 
     while asyncio.get_running_loop().time() < deadline:
+        login_signal = await check_for_login_required(page)
+        if login_signal:
+            print(f"\n   🔐 Login required while waiting: '{login_signal}'")
+            return False
+
         challenge = await check_for_challenge(page)
         if challenge:
             print(f"\n   ⚠️  CHALLENGE DETECTED while waiting: '{challenge}'")
@@ -206,7 +474,7 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
     Scrolls top→bottom collecting tweets.
     - No anchor (run 1): stops at max_tweets.
     - Anchor present: stops when anchor tweet is seen (no count cap).
-    Returns (new_tweets_added, first_tweet_of_this_run).
+    Returns (new_tweets_added, first_tweet_of_this_run, run_meta).
     """
     pause_min          = config["scrolling"].get("scroll_pause_min", 1.5)
     pause_max          = config["scrolling"].get("scroll_pause_max", 3.5)
@@ -221,12 +489,15 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
     new_count_total      = 0
     stale_rounds         = 0
     anchor_found         = False
+    stop_reason          = "max_iterations"
+    iterations_completed = 0
 
     mode_label = f"anchor mode — running until anchor found (cap: {max_tweets_anchor})" if anchor_mode \
                  else f"first run — collecting up to {max_tweets} tweets"
     print(f"\n🤖 Agent loop starting  ({mode_label})\n")
 
     for iteration in range(1, max_iter + 1):
+        iterations_completed = iteration
 
         # ── Challenge detection (every iteration) ────────────────
         challenge = await check_for_challenge(page)
@@ -235,7 +506,12 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             print("   🛑 Stopping scrape to protect your account.")
             print("   👉 Open the browser, resolve the challenge manually, then re-run.")
             save_tweets(all_tweets)
-            return new_count_total, first_tweet_this_run
+            return new_count_total, first_tweet_this_run, {
+                "anchor_mode": anchor_mode,
+                "anchor_found": False,
+                "stop_reason": "challenge_detected",
+                "iterations_completed": iterations_completed,
+            }
 
         # ── Human-like scroll then extract ───────────────────────
         # Random mouse nudge before scrolling
@@ -279,6 +555,7 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             # Stop if we've hit the anchor from the previous run
             if anchor_mode and url != "unknown" and url == anchor_url:
                 anchor_found = True
+                stop_reason = "anchor_found"
                 print(f"\n   🔖 Anchor tweet found — run complete.")
                 break
 
@@ -287,6 +564,17 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
                 all_tweets[dedup_key] = tweet
                 new_count_total += 1
                 new_this_iter   += 1
+            else:
+                existing = all_tweets[dedup_key]
+                existing.update({
+                    "author_name": tweet.get("author_name", existing.get("author_name", "")),
+                    "url": tweet.get("url", existing.get("url", "")),
+                    "posted_at": tweet.get("posted_at", existing.get("posted_at", "")),
+                    "replies": tweet.get("replies", existing.get("replies")),
+                    "retweets": tweet.get("retweets", existing.get("retweets")),
+                    "likes": tweet.get("likes", existing.get("likes")),
+                    "impressions": tweet.get("impressions", existing.get("impressions")),
+                })
 
         if anchor_found:
             break
@@ -307,21 +595,29 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
 
         # Run-1 stop: hit tweet target
         if not anchor_mode and total >= max_tweets:
+            stop_reason = "target_reached"
             print(f"\n   ✅ Target reached — {total} tweets collected.")
             break
 
         # Anchor-mode safety cap
         if anchor_mode and new_count_total >= max_tweets_anchor:
+            stop_reason = "anchor_mode_tweet_cap"
             print(f"\n   ✅ Anchor-mode cap reached — {new_count_total} new tweets collected.")
             break
 
         # Safety: too many stale rounds
         if stale_rounds >= 10:
+            stop_reason = "stale_rounds"
             print(f"\n   ⏹️  No new tweets for {stale_rounds} rounds. Stopping.")
             break
 
     save_tweets(all_tweets)
-    return new_count_total, first_tweet_this_run
+    return new_count_total, first_tweet_this_run, {
+        "anchor_mode": anchor_mode,
+        "anchor_found": anchor_found,
+        "stop_reason": stop_reason,
+        "iterations_completed": iterations_completed,
+    }
 
 
 # ─── Semantic scoring (all-mpnet-base-v2) ────────────────────
@@ -432,6 +728,149 @@ def score_tweets_batch(tweets: list[dict], **_) -> None:
         tweet["score"] = keep_score - skip_score
 
 
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def _normalize_relevance(raw_score: float, threshold: float) -> float:
+    ceiling = threshold + 0.45
+    if raw_score <= threshold:
+        return 0.0
+    return _clamp((raw_score - threshold) / max(ceiling - threshold, 1e-9))
+
+
+def _parse_posted_at(raw_value: str) -> datetime | None:
+    if not raw_value:
+        return None
+    try:
+        return datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _freshness_score(posted_at: str, now: datetime) -> float:
+    dt = _parse_posted_at(posted_at)
+    if dt is None:
+        return 0.35
+    age_hours = max((now - dt.astimezone(timezone.utc)).total_seconds() / 3600, 0.0)
+    return _clamp(math.exp(-age_hours / 18.0))
+
+
+def _safe_metric(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return max(float(value), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compute_composite_scores(tweets: list[dict], threshold: float) -> None:
+    if not tweets:
+        return
+
+    now = datetime.now(timezone.utc)
+    traction_raw = []
+    rate_raw = []
+    freshness_raw = []
+
+    for tweet in tweets:
+        likes = _safe_metric(tweet.get("likes"))
+        retweets = _safe_metric(tweet.get("retweets"))
+        replies = _safe_metric(tweet.get("replies"))
+        impressions = _safe_metric(tweet.get("impressions"))
+
+        traction = math.log1p(likes + (2.0 * retweets) + (1.5 * replies))
+        rate = math.log1p((1000.0 * (likes + (2.0 * retweets) + replies)) / max(impressions, 1.0)) if impressions > 0 else None
+        fresh = _freshness_score(tweet.get("posted_at", ""), now)
+
+        tweet["_traction_raw"] = traction
+        tweet["_engagement_rate_raw"] = rate
+        tweet["_freshness_raw"] = fresh
+        traction_raw.append(traction)
+        freshness_raw.append(fresh)
+        if rate is not None:
+            rate_raw.append(rate)
+
+    traction_max = max(traction_raw) if traction_raw else 1.0
+    freshness_max = max(freshness_raw) if freshness_raw else 1.0
+    rate_max = max(rate_raw) if rate_raw else None
+
+    for tweet in tweets:
+        relevance = _clamp(_safe_metric(tweet.get("llm_relevance_score")))
+        if relevance == 0.0:
+            relevance = _normalize_relevance(float(tweet.get("score", -999.0)), threshold)
+        freshness = tweet["_freshness_raw"] / freshness_max if freshness_max > 0 else 0.0
+        traction = tweet["_traction_raw"] / traction_max if traction_max > 0 else 0.0
+        rate_raw_value = tweet["_engagement_rate_raw"]
+        engagement_rate = (rate_raw_value / rate_max) if (rate_raw_value is not None and rate_max and rate_max > 0) else None
+
+        if engagement_rate is not None:
+            composite = (0.50 * relevance) + (0.20 * freshness) + (0.20 * traction) + (0.10 * engagement_rate)
+        else:
+            composite = (0.55 * relevance) + (0.25 * freshness) + (0.20 * traction)
+
+        tweet["relevance_score"] = round(relevance, 4)
+        tweet["freshness_score"] = round(freshness, 4)
+        tweet["traction_score"] = round(traction, 4)
+        if engagement_rate is not None:
+            tweet["engagement_rate_score"] = round(engagement_rate, 4)
+        else:
+            tweet.pop("engagement_rate_score", None)
+        tweet["composite_score"] = round(composite, 4)
+
+        del tweet["_traction_raw"]
+        del tweet["_engagement_rate_raw"]
+        del tweet["_freshness_raw"]
+
+
+def apply_handle_history_adjustments(tweets: list[dict], handle_stats: dict, config: dict) -> None:
+    handles = handle_stats.get("handles", {})
+    cfg = config.get("ranking", {})
+    repeat_penalty_each = _safe_metric(cfg.get("repeat_handle_penalty_each", 0.03))
+    repeat_penalty_cap = _safe_metric(cfg.get("repeat_handle_penalty_cap", 0.18))
+    popular_followers_floor = _safe_metric(cfg.get("popular_handle_min_followers", 10000))
+    poor_follower_engagement_rate = _safe_metric(cfg.get("poor_follower_engagement_rate", 0.001))
+    poor_follower_engagement_penalty = _safe_metric(cfg.get("poor_follower_engagement_penalty", 0.10))
+
+    for tweet in tweets:
+        handle = _normalize_handle(tweet.get("author", ""))
+        entry = handles.get(handle, {}) if handle else {}
+        prior_count = int(entry.get("reply_worthy_count") or 0)
+        repeat_penalty = min(prior_count * repeat_penalty_each, repeat_penalty_cap)
+
+        followers = _safe_metric(
+            tweet.get("author_followers",
+                      tweet.get("followers_count",
+                                entry.get("follower_count")))
+        )
+        engagement = (
+            _safe_metric(tweet.get("likes"))
+            + (2.0 * _safe_metric(tweet.get("retweets")))
+            + _safe_metric(tweet.get("replies"))
+        )
+        follower_engagement_rate = (engagement / followers) if followers > 0 else None
+
+        follower_penalty = 0.0
+        if (
+            followers >= popular_followers_floor
+            and follower_engagement_rate is not None
+            and follower_engagement_rate < poor_follower_engagement_rate
+        ):
+            follower_penalty = poor_follower_engagement_penalty
+
+        total_penalty = repeat_penalty + follower_penalty
+        base_composite = _safe_metric(tweet.get("composite_score"))
+        tweet["handle_reply_worthy_count"] = prior_count
+        tweet["handle_repeat_penalty"] = round(repeat_penalty, 4)
+        if follower_engagement_rate is not None:
+            tweet["follower_engagement_rate"] = round(follower_engagement_rate, 6)
+        else:
+            tweet.pop("follower_engagement_rate", None)
+        tweet["follower_engagement_penalty"] = round(follower_penalty, 4)
+        tweet["composite_score"] = round(_clamp(base_composite - total_penalty), 4)
+
+
 # ─── Two-stage filtering ─────────────────────────────────────
 # Stage 1: mpnet pre-filter (loose — only cuts obvious junk)
 # Lower threshold catches tangential but relevant tweets
@@ -457,7 +896,19 @@ Important: Relevance is about the UNDERLYING THEME, not surface vocabulary.
 A tweet about "why I can't stop doomscrolling" is relevant.
 A tweet quoting Bhagavad Gita but just sharing a festival date is not.
 
-Reply with JSON only: {"relevant": true/false, "reason": "one short sentence"}"""
+If relevant=true, also score whether @vedaselfhelp should reply based ONLY on closeness \
+of the tweet's content to the handle's character and themes.
+Do NOT score virality, author popularity, recency, likes, or whether the tweet is well-written.
+
+Use this relevance_score scale:
+- 0.00-0.30: not relevant to the handle
+- 0.31-0.55: weak or generic overlap
+- 0.56-0.75: relevant and replyable
+- 0.76-0.90: strongly aligned with the handle
+- 0.91-1.00: ideal fit for @vedaselfhelp's voice and themes
+
+Reply with JSON only:
+{"relevant": true/false, "relevance_score": 0.0-1.0, "reason": "one short sentence"}"""
 
 
 def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
@@ -485,15 +936,19 @@ def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
             result = json.loads(raw)
             tweet["llm_relevant"] = result.get("relevant", False)
             tweet["llm_reason"]   = result.get("reason", "")
+            tweet["llm_relevance_score"] = round(_clamp(_safe_metric(result.get("relevance_score"))), 4)
             if tweet["llm_relevant"]:
+                if tweet["llm_relevance_score"] <= 0:
+                    tweet["llm_relevance_score"] = 0.6
                 relevant.append(tweet)
-                print(f"      [{i}/{len(tweets)}] ✓  {tweet.get('author','?')} — {tweet['llm_reason']}")
+                print(f"      [{i}/{len(tweets)}] ✓  {tweet.get('author','?')} ({tweet['llm_relevance_score']:.2f}) — {tweet['llm_reason']}")
             else:
-                print(f"      [{i}/{len(tweets)}] ✗  {tweet.get('author','?')} — {tweet['llm_reason']}")
+                print(f"      [{i}/{len(tweets)}] ✗  {tweet.get('author','?')} ({tweet['llm_relevance_score']:.2f}) — {tweet['llm_reason']}")
         except Exception as e:
             # On error, keep the tweet (fail open)
             tweet["llm_relevant"] = True
             tweet["llm_reason"]   = f"[filter error: {e}]"
+            tweet["llm_relevance_score"] = _normalize_relevance(float(tweet.get("score", -999.0)), PREFILTER_THRESHOLD)
             relevant.append(tweet)
             print(f"      [{i}/{len(tweets)}] ?  filter error: {e}")
     return relevant
@@ -551,10 +1006,17 @@ def export_to_gsheets(tweets: list[dict], config: dict, sheet_title: str) -> str
     sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
 
     # Create filtered+scored worksheet
-    ws = sh.add_worksheet(title=sheet_title, rows=max(len(tweets) + 10, 50), cols=10)
+    ws = sh.add_worksheet(title=sheet_title, rows=max(len(tweets) + 10, 50), cols=24)
 
-    headers = ["#", "Author Name", "Handle", "Tweet Text", "Tweet URL",
-               "Similarity Score", "Suggested Reply"]
+    headers = [
+        "#", "Author Name", "Handle", "Tweet Text", "Tweet URL", "Posted At",
+        "Replies", "Retweets", "Likes", "Impressions",
+        "Local Prefilter Score", "LLM Relevance Score", "Freshness Score",
+        "Traction Score", "Engagement Rate Score", "Reply-Worthy Count This Run",
+        "Historical Reply-Worthy Count", "Handle Repeat Penalty", "Follower Engagement Rate",
+        "Follower Engagement Penalty", "Composite Score",
+        "LLM Reason", "Suggested Reply",
+    ]
     ws.append_row(headers, value_input_option="RAW")
 
     rows = []
@@ -565,7 +1027,23 @@ def export_to_gsheets(tweets: list[dict], config: dict, sheet_title: str) -> str
             tweet.get("author", ""),
             tweet.get("text", ""),
             tweet.get("url", ""),
+            tweet.get("posted_at", ""),
+            tweet.get("replies", ""),
+            tweet.get("retweets", ""),
+            tweet.get("likes", ""),
+            tweet.get("impressions", ""),
             round(tweet.get("score", 0.0), 4),
+            round(tweet.get("relevance_score", 0.0), 4),
+            round(tweet.get("freshness_score", 0.0), 4),
+            round(tweet.get("traction_score", 0.0), 4),
+            round(tweet.get("engagement_rate_score", 0.0), 4) if "engagement_rate_score" in tweet else "",
+            int(tweet.get("reply_worthy_count_this_run", 0) or 0),
+            int(tweet.get("handle_reply_worthy_count", 0) or 0),
+            round(tweet.get("handle_repeat_penalty", 0.0), 4),
+            round(tweet.get("follower_engagement_rate", 0.0), 6) if "follower_engagement_rate" in tweet else "",
+            round(tweet.get("follower_engagement_penalty", 0.0), 4),
+            round(tweet.get("composite_score", 0.0), 4),
+            tweet.get("llm_reason", ""),
             tweet.get("reply", ""),
         ])
 
@@ -582,9 +1060,11 @@ def export_raw_dump_to_gsheets(all_tweets: list[dict], config: dict, sheet_title
     sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
 
     # Create raw dump worksheet
-    ws = sh.add_worksheet(title=sheet_title, rows=max(len(all_tweets) + 10, 50), cols=8)
+    ws = sh.add_worksheet(title=sheet_title, rows=max(len(all_tweets) + 10, 50), cols=14)
 
-    headers = ["#", "Author Name", "Handle", "Tweet Text", "Tweet URL"]
+    headers = ["#", "Author Name", "Handle", "Tweet Text", "Tweet URL", "Posted At",
+               "Replies", "Retweets", "Likes", "Impressions", "Local Prefilter Score",
+               "LLM Relevance Score", "Composite Score"]
     ws.append_row(headers, value_input_option="RAW")
 
     rows = []
@@ -595,6 +1075,14 @@ def export_raw_dump_to_gsheets(all_tweets: list[dict], config: dict, sheet_title
             tweet.get("author", ""),
             tweet.get("text", ""),
             tweet.get("url", ""),
+            tweet.get("posted_at", ""),
+            tweet.get("replies", ""),
+            tweet.get("retweets", ""),
+            tweet.get("likes", ""),
+            tweet.get("impressions", ""),
+            round(tweet.get("score", 0.0), 4),
+            round(tweet.get("relevance_score", 0.0), 4),
+            round(tweet.get("composite_score", 0.0), 4),
         ])
 
     if rows:
@@ -617,6 +1105,7 @@ async def main():
     config     = load_config()
     anchor     = load_anchor()
     all_tweets = load_saved_tweets()
+    handle_stats = load_reply_worthy_handle_stats()
 
     print("=" * 60)
     print("  🐦 Twitter Scraper — DOM Edition")
@@ -628,6 +1117,12 @@ async def main():
         print("=" * 60)
         new_count    = 0
         new_tweet_keys = set()
+        scrape_meta = {
+            "anchor_mode": bool(anchor),
+            "anchor_found": None,
+            "stop_reason": "export_only",
+            "iterations_completed": 0,
+        }
     else:
         if anchor:
             print(f"  Mode:    CATCH-UP (anchor found from previous run)")
@@ -655,14 +1150,28 @@ async def main():
             await page.goto("https://x.com/home", timeout=60000)
 
             print("\n" + "=" * 60)
-            if PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir()):
-                print("  ✅ Saved session found — you should already be logged in.")
+            saved_session = has_saved_x_session()
+            if saved_session:
+                print("  ✅ Saved X session found — you should already be logged in.")
+            elif PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir()):
+                print("  ⚠️  Profile exists, but no authenticated X cookies were found.")
+                print("     If X opens signed out, log in once in this Chrome window so the profile can refresh.")
             else:
                 print("  👋 First run — please log in to Twitter in the browser window.")
             print("  Waiting for your home timeline to load automatically.")
             print("=" * 60)
 
-            if not await wait_for_timeline_ready(page):
+            if not saved_session:
+                await wait_for_manual_login()
+
+            timeline_ready = await wait_for_timeline_ready(page)
+            if not timeline_ready and await check_for_login_required(page):
+                print("\n   🔐 X is asking for sign-in. Keeping Chrome open so you can refresh the session.")
+                await wait_for_manual_login()
+                await page.goto("https://x.com/home", timeout=60000)
+                timeline_ready = await wait_for_timeline_ready(page)
+
+            if not timeline_ready:
                 print("\n   🛑 Timeline did not become ready in time.")
                 print("   👉 Confirm Chrome is logged in and X home is accessible, then re-run.")
                 await context.close()
@@ -671,7 +1180,7 @@ async def main():
             print("\n   ✅ Timeline detected. Taking over...\n")
             await asyncio.sleep(random.uniform(2.5, 4.5))   # human landing pause
 
-            new_count, first_tweet = await agent_loop(page, config, all_tweets, anchor)
+            new_count, first_tweet, scrape_meta = await agent_loop(page, config, all_tweets, anchor)
 
             # Update anchor to the first tweet seen this run
             if first_tweet and first_tweet.get("url", "unknown") != "unknown":
@@ -681,13 +1190,15 @@ async def main():
                 print("\n   ⚠️  Could not determine anchor tweet (no valid URL seen).")
 
             new_tweet_keys = set(all_tweets.keys()) - keys_before
+            if scrape_meta.get("anchor_mode") and not scrape_meta.get("anchor_found"):
+                print(f"\n   ⚠️  Previous anchor was not found. Stop reason: {scrape_meta.get('stop_reason')}")
+                print("   This run may not have fully caught up to the previous run.")
 
             print("\n   Browser closes in 10 seconds...")
             await asyncio.sleep(10)
             await context.close()
 
     # ── Score & filter (current run's tweets only) ───────────────
-    from datetime import datetime
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_list = list(all_tweets.values())
 
@@ -698,7 +1209,10 @@ async def main():
     else:
         run_tweets = all_list
 
-    model = config.get("openai", {}).get("model", "gpt-5.4")
+    openai_cfg = config.get("openai", {})
+    default_model = openai_cfg.get("model", "gpt-5.4")
+    filter_model = openai_cfg.get("filter_model", default_model)
+    reply_model = openai_cfg.get("reply_model", default_model)
 
     # ── Stage 1: mpnet pre-filter (loose) ────────────────────────
     threshold = config.get("filtering", {}).get("semantic_threshold", PREFILTER_THRESHOLD)
@@ -711,24 +1225,41 @@ async def main():
     print(f"   🔎 Pre-filter passed: {len(prefiltered)} / {len(run_tweets)} tweets")
 
     # ── Stage 2: LLM relevance filter ────────────────────────────
-    scored = llm_filter_tweets(prefiltered, model=model)
-    scored.sort(key=lambda t: t["score"], reverse=True)
+    scored = llm_filter_tweets(prefiltered, model=filter_model)
+    compute_composite_scores(scored, threshold)
+    apply_handle_history_adjustments(scored, handle_stats, config)
+    scored.sort(key=lambda t: t.get("composite_score", 0.0), reverse=True)
     print(f"   🎯 LLM filter matched {len(scored)} / {len(prefiltered)} tweets")
 
-    # ── Generate replies for top N ────────────────────────────────
-    top_n = config.get("openai", {}).get("top_n_replies", 10)
-    top   = scored[:top_n]
+    # ── Generate replies for high-fit tweets ─────────────────────
+    reply_min_relevance = openai_cfg.get("reply_min_relevance_score", 0.65)
+    max_replies = openai_cfg.get("max_replies", openai_cfg.get("top_n_replies", 25))
+    top = [
+        tweet for tweet in scored
+        if _safe_metric(tweet.get("llm_relevance_score", tweet.get("relevance_score"))) >= reply_min_relevance
+    ][:max_replies]
+    annotate_reply_worthy_batch_handles(top)
 
     if top:
-        print(f"\n   💬 Generating replies for top {len(top)} tweets...")
+        print(f"\n   💬 Generating replies for {len(top)} tweets with LLM relevance >= {reply_min_relevance}...")
         reply_guide = load_reply_guide()
         for i, tweet in enumerate(top, 1):
             try:
-                tweet["reply"] = generate_reply(tweet["text"], reply_guide, model)
+                tweet["reply"] = generate_reply(tweet["text"], reply_guide, reply_model)
                 print(f"      [{i}/{len(top)}] ✓  {tweet.get('author', '?')}")
             except Exception as e:
                 tweet["reply"] = f"[Error: {e}]"
                 print(f"      [{i}/{len(top)}] ✗  {e}")
+    else:
+        print(f"\n   💬 No tweets met reply threshold LLM relevance >= {reply_min_relevance}.")
+
+    if top:
+        record_reply_worthy_handles(top, handle_stats)
+        save_reply_worthy_handle_stats(handle_stats)
+        repeated = sum(1 for tweet in top if _safe_metric(tweet.get("handle_reply_worthy_count")) > 0)
+        print(f"   📇 Stored {len(top)} reply-worthy handles ({repeated} repeats from previous runs).")
+
+    save_tweets(all_tweets)
 
     # ── Export to Google Sheets ───────────────────────────────────
     print(f"\n   📤 Exporting to Google Sheets...")
@@ -736,6 +1267,21 @@ async def main():
 
     if new_tweet_keys:
         export_raw_dump_to_gsheets(run_tweets, config, f"New_{ts}")
+
+    append_run_history({
+        "run_ts": ts,
+        "export_only": args.export_only,
+        "anchor_mode": scrape_meta.get("anchor_mode"),
+        "anchor_found": scrape_meta.get("anchor_found"),
+        "stop_reason": scrape_meta.get("stop_reason"),
+        "iterations_completed": scrape_meta.get("iterations_completed"),
+        "new_tweets": new_count,
+        "total_accumulated": len(all_list),
+        "matching_filter": len(scored),
+        "old_anchor_url": anchor.get("url", "") if anchor else "",
+        "new_anchor_url": first_tweet.get("url", "") if not args.export_only and first_tweet else "",
+        "sheet_url": sheet_url,
+    })
 
     print("\n" + "=" * 60)
     print(f"  ✅ Done!")

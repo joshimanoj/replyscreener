@@ -4,6 +4,8 @@ credentials.txt
 
 # Browser session — contains login cookies
 browser_profile/
+.DS_Store
+logs/
 
 # Python
 venv/

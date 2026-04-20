@@ -11,19 +11,13 @@
     },
     "google_sheets": {
         "credentials_file": "google_credentials.json",
-        "spreadsheet_id": "16Xkyishy8Jop_xRnRfu_9jDIopdb28-FqA1xv1SMBvk"
+        "spreadsheet_id": "16Xkyishy8Jop_xRnRfu_9jDIopdb28-FqA1xv1SMBvk",
+        "worksheet_title": "Filtered Ranked Tweets"
     },
-    "openai": {
-        "filter_model": "gpt-4.1-mini",
-        "reply_model": "gpt-5.4",
-        "reply_min_relevance_score": 0.65,
-        "max_replies": 25
-    },
-    "ranking": {
-        "repeat_handle_penalty_each": 0.03,
-        "repeat_handle_penalty_cap": 0.18,
-        "popular_handle_min_followers": 10000,
-        "poor_follower_engagement_rate": 0.001,
-        "poor_follower_engagement_penalty": 0.1
+    "llm_filter": {
+        "provider": "ollama",
+        "model": "phi3:mini",
+        "host": "http://127.0.0.1:11434",
+        "timeout_seconds": 60
     }
 }

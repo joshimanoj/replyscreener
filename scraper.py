@@ -4,11 +4,11 @@ Twitter Timeline Scraper — DOM Edition
 ---------------------------------------
 Run 1 (no anchor): collect up to max_tweets, save first tweet as anchor.
 Run 2+ (anchor exists): collect ALL new tweets until anchor is found,
-  no count cap — guarantees zero gaps.
+  no count cap - guarantees zero gaps.
 
 Usage:
     python scraper.py               # full scrape + filter + export
-    python scraper.py --export-only # skip scraping, just filter + reply + export
+    python scraper.py --export-only # skip scraping, just filter + export
 """
 
 import argparse
@@ -18,39 +18,12 @@ import math
 import os
 import random
 import sys
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib import request as urlrequest
 
-try:
-    from playwright.async_api import async_playwright
-except ImportError:
-    print("\n❌ playwright is not installed.")
-    print("   pip install playwright && playwright install chromium\n")
-    sys.exit(1)
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except ImportError:
-    print("\n❌ gspread or google-auth not installed.")
-    print("   pip install gspread google-auth\n")
-    sys.exit(1)
-
-try:
-    import openai
-except ImportError:
-    print("\n❌ openai not installed.")
-    print("   pip install openai\n")
-    sys.exit(1)
-
-try:
-    from langdetect import detect as _lang_detect
-    from langdetect import LangDetectException
-except ImportError:
-    print("\n❌ langdetect not installed.")
-    print("   pip install langdetect\n")
-    sys.exit(1)
+_lang_detect = None
+LangDetectException = Exception
 
 
 # ─── Paths ───────────────────────────────────────────────────
@@ -58,9 +31,7 @@ except ImportError:
 SCRIPT_DIR       = Path(__file__).parent
 TWEETS_FILE      = SCRIPT_DIR / "all_tweets.json"
 ANCHOR_FILE      = SCRIPT_DIR / "anchor.json"
-REPLY_GUIDE_FILE = SCRIPT_DIR / "tweet_reply_guide"
 PROFILE_DIR      = SCRIPT_DIR / "browser_profile"   # persistent login session
-HANDLE_STATS_FILE = SCRIPT_DIR / "reply_worthy_handles.json"
 RUN_HISTORY_FILE  = SCRIPT_DIR / "run_history.jsonl"
 
 
@@ -110,63 +81,10 @@ def _normalize_handle(handle: str) -> str:
     return handle if handle.startswith("@") else f"@{handle}"
 
 
-def _handle_url(handle: str) -> str:
-    handle = _normalize_handle(handle)
-    return f"https://x.com/{handle.lstrip('@')}" if handle else ""
-
-
-def load_reply_worthy_handle_stats() -> dict:
-    if not HANDLE_STATS_FILE.exists():
-        return {"handles": {}}
-    with open(HANDLE_STATS_FILE) as f:
-        data = json.load(f)
-    if "handles" not in data:
-        return {"handles": data if isinstance(data, dict) else {}}
-    return data
-
-
-def save_reply_worthy_handle_stats(stats: dict) -> None:
-    stats["updated_at"] = datetime.now(timezone.utc).isoformat()
-    with open(HANDLE_STATS_FILE, "w") as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False)
-
-
 def append_run_history(record: dict) -> None:
     record["recorded_at"] = datetime.now(timezone.utc).isoformat()
     with open(RUN_HISTORY_FILE, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def record_reply_worthy_handles(tweets: list[dict], stats: dict) -> dict:
-    handles = stats.setdefault("handles", {})
-
-    for tweet in tweets:
-        handle = _normalize_handle(tweet.get("author", ""))
-        if not handle:
-            continue
-
-        entry = handles.setdefault(handle, {
-            "handle": handle,
-            "handle_url": _handle_url(handle),
-            "handle_name": "",
-            "follower_count": "",
-            "reply_worthy_count": 0,
-        })
-        entry["handle"] = handle
-        entry["handle_url"] = _handle_url(handle)
-        entry["handle_name"] = tweet.get("author_name", entry.get("handle_name", ""))
-        entry.setdefault("follower_count", "")
-        entry["reply_worthy_count"] = int(entry.get("reply_worthy_count") or 0) + 1
-
-    return stats
-
-
-def annotate_reply_worthy_batch_handles(tweets: list[dict]) -> None:
-    counts = Counter(_normalize_handle(tweet.get("author", "")) for tweet in tweets)
-    counts.pop("", None)
-    for tweet in tweets:
-        handle = _normalize_handle(tweet.get("author", ""))
-        tweet["reply_worthy_count_this_run"] = counts.get(handle, 0)
 
 
 # ─── Challenge / warning detection ──────────────────────────
@@ -683,9 +601,19 @@ _skip_embs = None
 
 
 def _load_model():
-    global _model, _keep_embs, _skip_embs
+    global _model, _keep_embs, _skip_embs, _lang_detect, LangDetectException
     if _model is not None:
         return
+    if _lang_detect is None:
+        try:
+            from langdetect import detect as _detect
+            from langdetect import LangDetectException as _LangDetectException
+        except ImportError:
+            print("\n❌ langdetect not installed.")
+            print("   pip install langdetect\n")
+            raise
+        _lang_detect = _detect
+        LangDetectException = _LangDetectException
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
@@ -765,6 +693,47 @@ def _safe_metric(value) -> float:
         return 0.0
 
 
+def _quote_style_signals(text: str) -> tuple[bool, str]:
+    text = (text or "").strip()
+    if not text:
+        return False, ""
+
+    compact = " ".join(text.split())
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lower = compact.lower()
+
+    if len(lines) >= 2 and lines[-1].startswith(("—", "-", "–")):
+        return True, "attribution_line"
+
+    if any(
+        marker in lower for marker in (
+            "quote of the day",
+            "daily quote",
+            "favorite quote",
+            "this quote",
+            "a quote that",
+        )
+    ):
+        return True, "explicit_quote_marker"
+
+    if compact.startswith(("\"", "'", "“", "‘")) and compact.endswith(("\"", "'", "”", "’")):
+        return True, "wrapped_in_quotes"
+
+    if (
+        len(lines) >= 2
+        and len(lines[-1].split()) <= 4
+        and lines[-1].replace(".", "").istitle()
+        and compact.count('"') + compact.count("“") + compact.count("”") >= 2
+    ):
+        return True, "quote_plus_author"
+
+    if any(name in lower for name in ("marcus aurelius", "seneca", "epictetus", "rumi", "carl jung")):
+        if any(symbol in compact for symbol in ("—", "–", "\"", "“", "”")):
+            return True, "named_attribution"
+
+    return False, ""
+
+
 def compute_composite_scores(tweets: list[dict], threshold: float) -> None:
     if not tweets:
         return
@@ -810,6 +779,10 @@ def compute_composite_scores(tweets: list[dict], threshold: float) -> None:
         else:
             composite = (0.55 * relevance) + (0.25 * freshness) + (0.20 * traction)
 
+        is_quote_style, quote_reason = _quote_style_signals(tweet.get("text", ""))
+        if is_quote_style:
+            composite = 0.0
+
         tweet["relevance_score"] = round(relevance, 4)
         tweet["freshness_score"] = round(freshness, 4)
         tweet["traction_score"] = round(traction, 4)
@@ -817,6 +790,9 @@ def compute_composite_scores(tweets: list[dict], threshold: float) -> None:
             tweet["engagement_rate_score"] = round(engagement_rate, 4)
         else:
             tweet.pop("engagement_rate_score", None)
+        tweet["quote_style"] = is_quote_style
+        tweet["quote_style_reason"] = quote_reason
+        tweet["quote_docked_to_zero"] = is_quote_style
         tweet["composite_score"] = round(composite, 4)
 
         del tweet["_traction_raw"]
@@ -824,59 +800,12 @@ def compute_composite_scores(tweets: list[dict], threshold: float) -> None:
         del tweet["_freshness_raw"]
 
 
-def apply_handle_history_adjustments(tweets: list[dict], handle_stats: dict, config: dict) -> None:
-    handles = handle_stats.get("handles", {})
-    cfg = config.get("ranking", {})
-    repeat_penalty_each = _safe_metric(cfg.get("repeat_handle_penalty_each", 0.03))
-    repeat_penalty_cap = _safe_metric(cfg.get("repeat_handle_penalty_cap", 0.18))
-    popular_followers_floor = _safe_metric(cfg.get("popular_handle_min_followers", 10000))
-    poor_follower_engagement_rate = _safe_metric(cfg.get("poor_follower_engagement_rate", 0.001))
-    poor_follower_engagement_penalty = _safe_metric(cfg.get("poor_follower_engagement_penalty", 0.10))
-
-    for tweet in tweets:
-        handle = _normalize_handle(tweet.get("author", ""))
-        entry = handles.get(handle, {}) if handle else {}
-        prior_count = int(entry.get("reply_worthy_count") or 0)
-        repeat_penalty = min(prior_count * repeat_penalty_each, repeat_penalty_cap)
-
-        followers = _safe_metric(
-            tweet.get("author_followers",
-                      tweet.get("followers_count",
-                                entry.get("follower_count")))
-        )
-        engagement = (
-            _safe_metric(tweet.get("likes"))
-            + (2.0 * _safe_metric(tweet.get("retweets")))
-            + _safe_metric(tweet.get("replies"))
-        )
-        follower_engagement_rate = (engagement / followers) if followers > 0 else None
-
-        follower_penalty = 0.0
-        if (
-            followers >= popular_followers_floor
-            and follower_engagement_rate is not None
-            and follower_engagement_rate < poor_follower_engagement_rate
-        ):
-            follower_penalty = poor_follower_engagement_penalty
-
-        total_penalty = repeat_penalty + follower_penalty
-        base_composite = _safe_metric(tweet.get("composite_score"))
-        tweet["handle_reply_worthy_count"] = prior_count
-        tweet["handle_repeat_penalty"] = round(repeat_penalty, 4)
-        if follower_engagement_rate is not None:
-            tweet["follower_engagement_rate"] = round(follower_engagement_rate, 6)
-        else:
-            tweet.pop("follower_engagement_rate", None)
-        tweet["follower_engagement_penalty"] = round(follower_penalty, 4)
-        tweet["composite_score"] = round(_clamp(base_composite - total_penalty), 4)
-
-
 # ─── Two-stage filtering ─────────────────────────────────────
 # Stage 1: mpnet pre-filter (loose — only cuts obvious junk)
 # Lower threshold catches tangential but relevant tweets
 PREFILTER_THRESHOLD = 0.3   # was 0.6
 
-RELEVANCE_SYSTEM_PROMPT = """You decide if a tweet is worth replying to from @vedaselfhelp — \
+RELEVANCE_SYSTEM_PROMPT = """You decide if a tweet is relevant for @vedaselfhelp to review - \
 a handle that bridges Vedic philosophy, Upanishadic wisdom, and modern psychology/self-help.
 
 A tweet is RELEVANT if it touches any of these (explicitly OR implicitly):
@@ -896,88 +825,150 @@ Important: Relevance is about the UNDERLYING THEME, not surface vocabulary.
 A tweet about "why I can't stop doomscrolling" is relevant.
 A tweet quoting Bhagavad Gita but just sharing a festival date is not.
 
-If relevant=true, also score whether @vedaselfhelp should reply based ONLY on closeness \
-of the tweet's content to the handle's character and themes.
-Do NOT score virality, author popularity, recency, likes, or whether the tweet is well-written.
+If relevant=true, score the tweet on TWO dimensions:
+1. topic_fit_score:
+- How directly the tweet matches the core topics above
+- High when the tweet is clearly about psychology, inner life, philosophy, or self-development
+- Low when overlap is vague, incidental, or just surface-level
 
-Use this relevance_score scale:
+2. philosophical_depth_score:
+- How much reflective, introspective, or meaning-oriented substance the tweet has
+- High when it contains real insight about mind, self, suffering, awareness, behavior, or meaning
+- Low when it is generic advice, slogan-like inspiration, or shallow spiritual language
+
+Then compute an overall relevance_score as a weighted blend:
+- relevance_score = 0.65 * topic_fit_score + 0.35 * philosophical_depth_score
+
+Scoring guidance:
+- Use the full range from 0.00 to 1.00
+- Avoid defaulting to common values like 0.65 or 0.85
+- If two tweets differ meaningfully, their scores should differ too
+- Only use 0.85+ for unusually strong alignment
+- Do NOT score virality, author popularity, recency, likes, or writing quality
+
+Use these anchor meanings:
 - 0.00-0.30: not relevant to the handle
 - 0.31-0.55: weak or generic overlap
-- 0.56-0.75: relevant and replyable
+- 0.56-0.75: relevant and strong enough to keep
 - 0.76-0.90: strongly aligned with the handle
-- 0.91-1.00: ideal fit for @vedaselfhelp's voice and themes
+- 0.91-1.00: exceptional fit
 
 Reply with JSON only:
-{"relevant": true/false, "relevance_score": 0.0-1.0, "reason": "one short sentence"}"""
+{"relevant": true/false, "topic_fit_score": 0.0-1.0, "philosophical_depth_score": 0.0-1.0, "relevance_score": 0.0-1.0, "reason": "one short sentence"}"""
+
+
+def _blend_llm_relevance(result: dict) -> tuple[float, float, float]:
+    topic_fit = _clamp(_safe_metric(result.get("topic_fit_score")))
+    depth = _clamp(_safe_metric(result.get("philosophical_depth_score")))
+    explicit = _clamp(_safe_metric(result.get("relevance_score")))
+
+    blended = (0.65 * topic_fit) + (0.35 * depth)
+    if topic_fit > 0.0 or depth > 0.0:
+        return round(topic_fit, 4), round(depth, 4), round(blended, 4)
+    return round(topic_fit, 4), round(depth, 4), round(explicit, 4)
+
+
+def _extract_json_object(raw: str) -> dict:
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Empty model response.")
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = raw[start:end + 1]
+            return json.loads(candidate)
+        raise
 
 
 def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
     """Stage 2: LLM relevance filter for tweets that passed the mpnet pre-filter."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
-    client = openai.OpenAI(api_key=api_key)
+    cfg = load_config().get("llm_filter", {})
+    provider = (cfg.get("provider") or "ollama").strip().lower()
+    host = (cfg.get("host") or "http://127.0.0.1:11434").rstrip("/")
+    timeout_seconds = max(int(cfg.get("timeout_seconds", 60) or 60), 1)
+
+    if provider != "ollama":
+        raise RuntimeError(f"Unsupported llm_filter provider: {provider}")
 
     relevant = []
-    print(f"   🤖 LLM-filtering {len(tweets)} pre-filtered tweets...")
+    print(f"   🤖 LLM-filtering {len(tweets)} pre-filtered tweets with {provider}/{model}...")
     for i, tweet in enumerate(tweets, 1):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
+            result = None
+            last_raw = ""
+            for attempt in range(2):
+                messages = [
                     {"role": "system", "content": RELEVANCE_SYSTEM_PROMPT},
-                    {"role": "user",   "content": f"TWEET: {tweet['text']}"},
-                ],
-                max_completion_tokens=80,
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content.strip()
-            result = json.loads(raw)
+                    {"role": "user", "content": f"TWEET: {tweet['text']}"},
+                ]
+                if attempt == 1:
+                    messages.append({
+                        "role": "user",
+                        "content": "Your previous answer was malformed. Reply again with valid JSON only. Keep reason under 12 words.",
+                    })
+
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "format": "json",
+                    "messages": messages,
+                    "options": {
+                        "temperature": 0,
+                        "num_predict": 140,
+                    },
+                }
+                req = urlrequest.Request(
+                    f"{host}/api/chat",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlrequest.urlopen(req, timeout=timeout_seconds) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                last_raw = (body.get("message") or {}).get("content", "").strip()
+                try:
+                    result = _extract_json_object(last_raw)
+                    break
+                except json.JSONDecodeError:
+                    if attempt == 1:
+                        raise
+            if result is None:
+                raise ValueError(f"Could not parse model JSON: {last_raw[:200]}")
+            topic_fit_score, philosophical_depth_score, relevance_score = _blend_llm_relevance(result)
             tweet["llm_relevant"] = result.get("relevant", False)
             tweet["llm_reason"]   = result.get("reason", "")
-            tweet["llm_relevance_score"] = round(_clamp(_safe_metric(result.get("relevance_score"))), 4)
+            tweet["llm_topic_fit_score"] = topic_fit_score
+            tweet["llm_philosophical_depth_score"] = philosophical_depth_score
+            tweet["llm_relevance_score"] = relevance_score
             if tweet["llm_relevant"]:
                 if tweet["llm_relevance_score"] <= 0:
                     tweet["llm_relevance_score"] = 0.6
                 relevant.append(tweet)
-                print(f"      [{i}/{len(tweets)}] ✓  {tweet.get('author','?')} ({tweet['llm_relevance_score']:.2f}) — {tweet['llm_reason']}")
+                print(
+                    f"      [{i}/{len(tweets)}] ✓  {tweet.get('author','?')} "
+                    f"(overall={tweet['llm_relevance_score']:.2f}, topic={topic_fit_score:.2f}, depth={philosophical_depth_score:.2f}) "
+                    f"— {tweet['llm_reason']}"
+                )
             else:
-                print(f"      [{i}/{len(tweets)}] ✗  {tweet.get('author','?')} ({tweet['llm_relevance_score']:.2f}) — {tweet['llm_reason']}")
+                print(
+                    f"      [{i}/{len(tweets)}] ✗  {tweet.get('author','?')} "
+                    f"(overall={tweet['llm_relevance_score']:.2f}, topic={topic_fit_score:.2f}, depth={philosophical_depth_score:.2f}) "
+                    f"— {tweet['llm_reason']}"
+                )
         except Exception as e:
             # On error, keep the tweet (fail open)
             tweet["llm_relevant"] = True
             tweet["llm_reason"]   = f"[filter error: {e}]"
+            tweet["llm_topic_fit_score"] = 0.0
+            tweet["llm_philosophical_depth_score"] = 0.0
             tweet["llm_relevance_score"] = _normalize_relevance(float(tweet.get("score", -999.0)), PREFILTER_THRESHOLD)
             relevant.append(tweet)
             print(f"      [{i}/{len(tweets)}] ?  filter error: {e}")
     return relevant
-
-
-# ─── Reply guide ──────────────────────────────────────────────
-
-def load_reply_guide() -> str:
-    with open(REPLY_GUIDE_FILE) as f:
-        return f.read().strip()
-
-
-# ─── OpenAI reply generation ──────────────────────────────────
-
-def generate_reply(tweet_text: str, reply_guide: str, model: str = "gpt-5.4") -> str:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
-    client = openai.OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": reply_guide},
-            {"role": "user",   "content": f"TWEET: {tweet_text}"},
-        ],
-        max_completion_tokens=300,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
 
 
 # ─── Google Sheets export ─────────────────────────────────────
@@ -989,6 +980,11 @@ GSHEETS_SCOPES = [
 
 
 def _gspread_client(credentials_file: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError as exc:
+        raise RuntimeError("gspread and google-auth are required for Google Sheets export.") from exc
     creds = Credentials.from_service_account_file(credentials_file, scopes=GSHEETS_SCOPES)
     return gspread.authorize(creds)
 
@@ -1002,20 +998,41 @@ def _get_gsheets_client_and_sheet(config: dict):
     return sh, spreadsheet_id
 
 
-def export_to_gsheets(tweets: list[dict], config: dict, sheet_title: str) -> str:
-    sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
+def _prepare_ranked_worksheet(sh, worksheet_title: str, rows: int, cols: int):
+    try:
+        ws = sh.worksheet(worksheet_title)
+        ws.clear()
+        if ws.row_count < rows or ws.col_count < cols:
+            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols))
+    except Exception:
+        ws = sh.add_worksheet(title=worksheet_title, rows=rows, cols=cols)
 
-    # Create filtered+scored worksheet
-    ws = sh.add_worksheet(title=sheet_title, rows=max(len(tweets) + 10, 50), cols=24)
+    for stale_ws in list(sh.worksheets()):
+        if stale_ws.id == ws.id:
+            continue
+        if stale_ws.title.startswith("Run_") or stale_ws.title.startswith("New_"):
+            sh.del_worksheet(stale_ws)
+
+    return ws
+
+
+def export_to_gsheets(tweets: list[dict], config: dict) -> str:
+    sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
+    worksheet_title = config.get("google_sheets", {}).get("worksheet_title", "Filtered Ranked Tweets")
+
+    # Keep a single stable worksheet with only the final ranked output.
+    ws = _prepare_ranked_worksheet(
+        sh,
+        worksheet_title=worksheet_title,
+        rows=max(len(tweets) + 10, 50),
+        cols=23,
+    )
 
     headers = [
         "#", "Author Name", "Handle", "Tweet Text", "Tweet URL", "Posted At",
         "Replies", "Retweets", "Likes", "Impressions",
-        "Local Prefilter Score", "LLM Relevance Score", "Freshness Score",
-        "Traction Score", "Engagement Rate Score", "Reply-Worthy Count This Run",
-        "Historical Reply-Worthy Count", "Handle Repeat Penalty", "Follower Engagement Rate",
-        "Follower Engagement Penalty", "Composite Score",
-        "LLM Reason", "Suggested Reply",
+        "Local Prefilter Score", "LLM Topic Fit Score", "LLM Philosophical Depth Score", "LLM Relevance Score", "Freshness Score",
+        "Traction Score", "Engagement Rate Score", "Quote Style", "Quote Style Reason", "Quote Docked To Zero", "Composite Score", "LLM Reason",
     ]
     ws.append_row(headers, value_input_option="RAW")
 
@@ -1033,64 +1050,24 @@ def export_to_gsheets(tweets: list[dict], config: dict, sheet_title: str) -> str
             tweet.get("likes", ""),
             tweet.get("impressions", ""),
             round(tweet.get("score", 0.0), 4),
+            round(tweet.get("llm_topic_fit_score", 0.0), 4),
+            round(tweet.get("llm_philosophical_depth_score", 0.0), 4),
             round(tweet.get("relevance_score", 0.0), 4),
             round(tweet.get("freshness_score", 0.0), 4),
             round(tweet.get("traction_score", 0.0), 4),
             round(tweet.get("engagement_rate_score", 0.0), 4) if "engagement_rate_score" in tweet else "",
-            int(tweet.get("reply_worthy_count_this_run", 0) or 0),
-            int(tweet.get("handle_reply_worthy_count", 0) or 0),
-            round(tweet.get("handle_repeat_penalty", 0.0), 4),
-            round(tweet.get("follower_engagement_rate", 0.0), 6) if "follower_engagement_rate" in tweet else "",
-            round(tweet.get("follower_engagement_penalty", 0.0), 4),
+            tweet.get("quote_style", False),
+            tweet.get("quote_style_reason", ""),
+            tweet.get("quote_docked_to_zero", False),
             round(tweet.get("composite_score", 0.0), 4),
             tweet.get("llm_reason", ""),
-            tweet.get("reply", ""),
         ])
 
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
 
-    sheet_url = (f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-                 f"/edit#gid={ws.id}")
-    print(f"   📊 Filtered tab: {len(tweets)} tweets → {sheet_url}")
-    return sheet_url
-
-
-def export_raw_dump_to_gsheets(all_tweets: list[dict], config: dict, sheet_title: str) -> str:
-    sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
-
-    # Create raw dump worksheet
-    ws = sh.add_worksheet(title=sheet_title, rows=max(len(all_tweets) + 10, 50), cols=14)
-
-    headers = ["#", "Author Name", "Handle", "Tweet Text", "Tweet URL", "Posted At",
-               "Replies", "Retweets", "Likes", "Impressions", "Local Prefilter Score",
-               "LLM Relevance Score", "Composite Score"]
-    ws.append_row(headers, value_input_option="RAW")
-
-    rows = []
-    for i, tweet in enumerate(all_tweets, 1):
-        rows.append([
-            i,
-            tweet.get("author_name", ""),
-            tweet.get("author", ""),
-            tweet.get("text", ""),
-            tweet.get("url", ""),
-            tweet.get("posted_at", ""),
-            tweet.get("replies", ""),
-            tweet.get("retweets", ""),
-            tweet.get("likes", ""),
-            tweet.get("impressions", ""),
-            round(tweet.get("score", 0.0), 4),
-            round(tweet.get("relevance_score", 0.0), 4),
-            round(tweet.get("composite_score", 0.0), 4),
-        ])
-
-    if rows:
-        ws.append_rows(rows, value_input_option="RAW")
-
-    sheet_url = (f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-                 f"/edit#gid={ws.id}")
-    print(f"   📊 Raw dump tab:  {len(all_tweets)} tweets → {sheet_url}")
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}"
+    print(f"   📊 Ranked sheet: {len(tweets)} tweets → {sheet_url}")
     return sheet_url
 
 
@@ -1099,13 +1076,12 @@ def export_raw_dump_to_gsheets(all_tweets: list[dict], config: dict, sheet_title
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--export-only", action="store_true",
-                        help="Skip scraping — score, generate replies, and export existing tweets")
+                        help="Skip scraping - score, filter, and export existing tweets")
     args = parser.parse_args()
 
     config     = load_config()
     anchor     = load_anchor()
     all_tweets = load_saved_tweets()
-    handle_stats = load_reply_worthy_handle_stats()
 
     print("=" * 60)
     print("  🐦 Twitter Scraper — DOM Edition")
@@ -1133,6 +1109,13 @@ async def main():
         print("=" * 60)
 
         keys_before    = set(all_tweets.keys())
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            print("\n❌ playwright is not installed.")
+            print("   pip install playwright && playwright install chromium\n")
+            return
 
         async with async_playwright() as p:
             PROFILE_DIR.mkdir(exist_ok=True)
@@ -1199,20 +1182,17 @@ async def main():
             await context.close()
 
     # ── Score & filter (current run's tweets only) ───────────────
-    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_list = list(all_tweets.values())
 
     # In a normal run: process only new tweets collected this session.
-    # In --export-only: no scraping happened, so fall back to all tweets.
-    if new_tweet_keys:
-        run_tweets = [all_tweets[k] for k in new_tweet_keys if k in all_tweets]
-    else:
+    # In --export-only: no scraping happened, so fall back to all saved tweets.
+    if args.export_only:
         run_tweets = all_list
+    else:
+        run_tweets = [all_tweets[k] for k in new_tweet_keys if k in all_tweets]
 
-    openai_cfg = config.get("openai", {})
-    default_model = openai_cfg.get("model", "gpt-5.4")
-    filter_model = openai_cfg.get("filter_model", default_model)
-    reply_model = openai_cfg.get("reply_model", default_model)
+    llm_filter_cfg = config.get("llm_filter", {})
+    filter_model = llm_filter_cfg.get("model", "phi3:mini")
 
     # ── Stage 1: mpnet pre-filter (loose) ────────────────────────
     threshold = config.get("filtering", {}).get("semantic_threshold", PREFILTER_THRESHOLD)
@@ -1227,49 +1207,17 @@ async def main():
     # ── Stage 2: LLM relevance filter ────────────────────────────
     scored = llm_filter_tweets(prefiltered, model=filter_model)
     compute_composite_scores(scored, threshold)
-    apply_handle_history_adjustments(scored, handle_stats, config)
     scored.sort(key=lambda t: t.get("composite_score", 0.0), reverse=True)
     print(f"   🎯 LLM filter matched {len(scored)} / {len(prefiltered)} tweets")
-
-    # ── Generate replies for high-fit tweets ─────────────────────
-    reply_min_relevance = openai_cfg.get("reply_min_relevance_score", 0.65)
-    max_replies = openai_cfg.get("max_replies", openai_cfg.get("top_n_replies", 25))
-    top = [
-        tweet for tweet in scored
-        if _safe_metric(tweet.get("llm_relevance_score", tweet.get("relevance_score"))) >= reply_min_relevance
-    ][:max_replies]
-    annotate_reply_worthy_batch_handles(top)
-
-    if top:
-        print(f"\n   💬 Generating replies for {len(top)} tweets with LLM relevance >= {reply_min_relevance}...")
-        reply_guide = load_reply_guide()
-        for i, tweet in enumerate(top, 1):
-            try:
-                tweet["reply"] = generate_reply(tweet["text"], reply_guide, reply_model)
-                print(f"      [{i}/{len(top)}] ✓  {tweet.get('author', '?')}")
-            except Exception as e:
-                tweet["reply"] = f"[Error: {e}]"
-                print(f"      [{i}/{len(top)}] ✗  {e}")
-    else:
-        print(f"\n   💬 No tweets met reply threshold LLM relevance >= {reply_min_relevance}.")
-
-    if top:
-        record_reply_worthy_handles(top, handle_stats)
-        save_reply_worthy_handle_stats(handle_stats)
-        repeated = sum(1 for tweet in top if _safe_metric(tweet.get("handle_reply_worthy_count")) > 0)
-        print(f"   📇 Stored {len(top)} reply-worthy handles ({repeated} repeats from previous runs).")
 
     save_tweets(all_tweets)
 
     # ── Export to Google Sheets ───────────────────────────────────
     print(f"\n   📤 Exporting to Google Sheets...")
-    sheet_url = export_to_gsheets(scored, config, f"Run_{ts}")
-
-    if new_tweet_keys:
-        export_raw_dump_to_gsheets(run_tweets, config, f"New_{ts}")
+    sheet_url = export_to_gsheets(scored, config)
 
     append_run_history({
-        "run_ts": ts,
+        "run_ts": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "export_only": args.export_only,
         "anchor_mode": scrape_meta.get("anchor_mode"),
         "anchor_found": scrape_meta.get("anchor_found"),

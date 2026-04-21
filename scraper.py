@@ -9,6 +9,8 @@ Run 2+ (anchor exists): collect ALL new tweets until anchor is found,
 Usage:
     python scraper.py               # full scrape + filter + export
     python scraper.py --export-only # skip scraping, just filter + export
+    python scraper.py --rank-sheet-only
+                                   # rerun Phi-3 ranking for current sheet rows
 """
 
 import argparse
@@ -17,7 +19,10 @@ import json
 import math
 import os
 import random
+import shutil
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
@@ -884,6 +889,74 @@ def _extract_json_object(raw: str) -> dict:
         raise
 
 
+def _ollama_json(host: str, path: str, timeout_seconds: int = 5) -> dict:
+    with urlrequest.urlopen(f"{host}{path}", timeout=timeout_seconds) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _ollama_is_ready(host: str) -> bool:
+    try:
+        _ollama_json(host, "/api/tags", timeout_seconds=3)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_ollama_ready(cfg: dict, model: str) -> subprocess.Popen | None:
+    host = (cfg.get("host") or "http://127.0.0.1:11434").rstrip("/")
+    startup_timeout = max(int(cfg.get("startup_timeout_seconds", 30) or 30), 1)
+    auto_start = bool(cfg.get("auto_start", True))
+
+    if _ollama_is_ready(host):
+        print(f"   🟢 Ollama already running at {host}")
+    else:
+        if not auto_start:
+            raise RuntimeError(f"Ollama is not running at {host}. Start `ollama serve` or enable llm_filter.auto_start.")
+        ollama_bin = shutil.which("ollama")
+        if not ollama_bin:
+            raise RuntimeError("Ollama CLI not found on PATH. Install Ollama or add it to PATH.")
+
+        log_path = SCRIPT_DIR / "logs" / "ollama-serve.log"
+        log_path.parent.mkdir(exist_ok=True)
+        print(f"   🚀 Starting Ollama server... logs: {log_path}")
+        log_file = open(log_path, "ab")
+        process = subprocess.Popen(
+            [ollama_bin, "serve"],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        process._replyscreener_log_file = log_file  # keep the log handle alive with the process
+
+        deadline = time.time() + startup_timeout
+        while time.time() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"`ollama serve` exited early with code {process.returncode}. Check {log_path}.")
+            if _ollama_is_ready(host):
+                print(f"   ✅ Ollama ready at {host}")
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError(f"Ollama did not become ready within {startup_timeout}s. Check {log_path}.")
+    try:
+        tags = _ollama_json(host, "/api/tags", timeout_seconds=5)
+        models = {
+            item.get("name", "")
+            for item in tags.get("models", [])
+        }
+        model_roots = {name.split(":", 1)[0] for name in models if name}
+        if model not in models and model.split(":", 1)[0] not in model_roots:
+            ollama_bin = shutil.which("ollama")
+            if not ollama_bin:
+                raise RuntimeError("Ollama CLI not found on PATH. Install Ollama or add it to PATH.")
+            print(f"   📦 Pulling missing Ollama model: {model}")
+            subprocess.run([ollama_bin, "pull", model], check=True)
+    except Exception as exc:
+        raise RuntimeError(f"Ollama is running, but model `{model}` could not be verified/pulled: {exc}") from exc
+
+    return locals().get("process")
+
+
 def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
     """Stage 2: LLM relevance filter for tweets that passed the mpnet pre-filter."""
     cfg = load_config().get("llm_filter", {})
@@ -893,6 +966,8 @@ def llm_filter_tweets(tweets: list[dict], model: str) -> list[dict]:
 
     if provider != "ollama":
         raise RuntimeError(f"Unsupported llm_filter provider: {provider}")
+
+    ensure_ollama_ready(cfg, model)
 
     relevant = []
     print(f"   🤖 LLM-filtering {len(tweets)} pre-filtered tweets with {provider}/{model}...")
@@ -1016,6 +1091,73 @@ def _prepare_ranked_worksheet(sh, worksheet_title: str, rows: int, cols: int):
     return ws
 
 
+def _worksheet_from_config_or_gid(sh, config: dict, gid: str | None = None):
+    if gid:
+        for ws in sh.worksheets():
+            if str(ws.id) == str(gid):
+                return ws
+        raise RuntimeError(f"No worksheet found with gid={gid}")
+    worksheet_title = config.get("google_sheets", {}).get("worksheet_title", "Filtered Ranked Tweets")
+    return sh.worksheet(worksheet_title)
+
+
+def _num(value, default=0.0):
+    if value in (None, ""):
+        return default
+    try:
+        return float(str(value).replace(",", ""))
+    except ValueError:
+        return default
+
+
+def _bool_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"true", "yes", "1"}
+
+
+def load_ranked_sheet_tweets(config: dict, gid: str | None = None) -> tuple[list[dict], str]:
+    sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
+    ws = _worksheet_from_config_or_gid(sh, config, gid)
+    values = ws.get_all_values()
+    if not values:
+        return [], f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}"
+
+    headers = values[0]
+    rows = values[1:]
+    idx = {header: pos for pos, header in enumerate(headers)}
+
+    def cell(row, header, default=""):
+        pos = idx.get(header)
+        if pos is None or pos >= len(row):
+            return default
+        return row[pos]
+
+    tweets = []
+    for row in rows:
+        if not any(str(value).strip() for value in row):
+            continue
+        tweet = {
+            "author_name": cell(row, "Author Name"),
+            "author": cell(row, "Handle"),
+            "text": cell(row, "Tweet Text"),
+            "url": cell(row, "Tweet URL"),
+            "posted_at": cell(row, "Posted At"),
+            "replies": _num(cell(row, "Replies")),
+            "retweets": _num(cell(row, "Retweets")),
+            "likes": _num(cell(row, "Likes")),
+            "impressions": _num(cell(row, "Impressions")),
+            "score": _num(cell(row, "Local Prefilter Score"), default=0.0),
+            "quote_style": _bool_value(cell(row, "Quote Style")),
+            "quote_style_reason": cell(row, "Quote Style Reason"),
+            "quote_docked_to_zero": _bool_value(cell(row, "Quote Docked To Zero")),
+        }
+        if tweet["text"]:
+            tweets.append(tweet)
+
+    return tweets, f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}"
+
+
 def export_to_gsheets(tweets: list[dict], config: dict) -> str:
     sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
     worksheet_title = config.get("google_sheets", {}).get("worksheet_title", "Filtered Ranked Tweets")
@@ -1071,12 +1213,70 @@ def export_to_gsheets(tweets: list[dict], config: dict) -> str:
     return sheet_url
 
 
+def rerank_existing_sheet(config: dict, gid: str | None = None) -> str:
+    threshold = config.get("filtering", {}).get("semantic_threshold", PREFILTER_THRESHOLD)
+    filter_model = config.get("llm_filter", {}).get("model", "phi3:mini")
+
+    print("\n   📥 Loading existing Google Sheet rows...")
+    sheet_tweets, source_url = load_ranked_sheet_tweets(config, gid=gid)
+    print(f"   📄 Source sheet: {len(sheet_tweets)} rows → {source_url}")
+    if not sheet_tweets:
+        raise RuntimeError("The selected worksheet has no tweet rows to rank.")
+
+    print(f"\n   🤖 Re-running Phi-3 ranking for existing sheet rows...")
+    scored = llm_filter_tweets(sheet_tweets, model=filter_model)
+    compute_composite_scores(scored, threshold)
+    scored.sort(key=lambda t: t.get("composite_score", 0.0), reverse=True)
+    print(f"   🎯 LLM filter matched {len(scored)} / {len(sheet_tweets)} tweets")
+
+    all_tweets = load_saved_tweets()
+    by_url = {
+        tweet.get("url"): tweet
+        for tweet in all_tweets.values()
+        if tweet.get("url")
+    }
+    for tweet in scored:
+        saved = by_url.get(tweet.get("url"))
+        if saved is not None:
+            saved.update({
+                "llm_relevant": tweet.get("llm_relevant"),
+                "llm_reason": tweet.get("llm_reason", ""),
+                "llm_topic_fit_score": tweet.get("llm_topic_fit_score", 0.0),
+                "llm_philosophical_depth_score": tweet.get("llm_philosophical_depth_score", 0.0),
+                "llm_relevance_score": tweet.get("llm_relevance_score", 0.0),
+                "relevance_score": tweet.get("relevance_score", 0.0),
+                "freshness_score": tweet.get("freshness_score", 0.0),
+                "traction_score": tweet.get("traction_score", 0.0),
+                "engagement_rate_score": tweet.get("engagement_rate_score", ""),
+                "quote_style": tweet.get("quote_style", False),
+                "quote_style_reason": tweet.get("quote_style_reason", ""),
+                "quote_docked_to_zero": tweet.get("quote_docked_to_zero", False),
+                "composite_score": tweet.get("composite_score", 0.0),
+            })
+    save_tweets(all_tweets)
+
+    print(f"\n   📤 Rewriting Google Sheet with repaired ranking...")
+    sheet_url = export_to_gsheets(scored, config)
+    append_run_history({
+        "run_ts": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "rank_sheet_only": True,
+        "source_sheet_url": source_url,
+        "matching_filter": len(scored),
+        "sheet_url": sheet_url,
+    })
+    return sheet_url
+
+
 # ─── Main ─────────────────────────────────────────────────────
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--export-only", action="store_true",
                         help="Skip scraping - score, filter, and export existing tweets")
+    parser.add_argument("--rank-sheet-only", action="store_true",
+                        help="Skip scraping/mpnet and rerun Phi-3 ranking on the current Google Sheet rows")
+    parser.add_argument("--sheet-gid",
+                        help="Optional Google Sheets gid to read for --rank-sheet-only")
     args = parser.parse_args()
 
     config     = load_config()
@@ -1086,6 +1286,16 @@ async def main():
     print("=" * 60)
     print("  🐦 Twitter Scraper — DOM Edition")
     print("=" * 60)
+
+    if args.rank_sheet_only:
+        print("  Mode:    RANK SHEET ONLY")
+        print("=" * 60)
+        sheet_url = rerank_existing_sheet(config, gid=args.sheet_gid)
+        print("\n" + "=" * 60)
+        print("  ✅ Done!")
+        print(f"  Sheet:                {sheet_url}")
+        print("=" * 60)
+        return
 
     # ── Scraping phase (skipped with --export-only) ───────────────
     if args.export_only:

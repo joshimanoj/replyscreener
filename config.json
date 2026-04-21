@@ -18,6 +18,8 @@
         "provider": "ollama",
         "model": "phi3:mini",
         "host": "http://127.0.0.1:11434",
-        "timeout_seconds": 60
+        "timeout_seconds": 60,
+        "auto_start": true,
+        "startup_timeout_seconds": 30
     }
 }

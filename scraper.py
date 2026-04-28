@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import asyncio
+import csv
+import importlib.util
 import json
 import math
 import os
@@ -38,6 +40,7 @@ TWEETS_FILE      = SCRIPT_DIR / "all_tweets.json"
 ANCHOR_FILE      = SCRIPT_DIR / "anchor.json"
 PROFILE_DIR      = SCRIPT_DIR / "browser_profile"   # persistent login session
 RUN_HISTORY_FILE  = SCRIPT_DIR / "run_history.jsonl"
+HANDLE_FREQUENCY_FILE = SCRIPT_DIR / "handle_frequency.csv"
 
 
 # ─── Config ──────────────────────────────────────────────────
@@ -45,6 +48,26 @@ RUN_HISTORY_FILE  = SCRIPT_DIR / "run_history.jsonl"
 def load_config():
     with open(SCRIPT_DIR / "config.json") as f:
         return json.load(f)
+
+
+def ensure_playwright_node() -> None:
+    """
+    Playwright normally uses its bundled Node binary, but some installs can miss
+    that file while still shipping the JS driver package. In that case, fall back
+    to the system Node.js executable so Playwright can start.
+    """
+    if os.getenv("PLAYWRIGHT_NODEJS_PATH"):
+        return
+
+    spec = importlib.util.find_spec("playwright")
+    if spec and spec.origin:
+        driver_node = Path(spec.origin).resolve().parent / "driver" / "node"
+        if driver_node.exists():
+            return
+
+    system_node = shutil.which("node")
+    if system_node:
+        os.environ["PLAYWRIGHT_NODEJS_PATH"] = system_node
 
 
 # ─── Anchor helpers ──────────────────────────────────────────
@@ -90,6 +113,79 @@ def append_run_history(record: dict) -> None:
     record["recorded_at"] = datetime.now(timezone.utc).isoformat()
     with open(RUN_HISTORY_FILE, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def write_handle_frequency_csv(all_tweets: dict, destination: Path = HANDLE_FREQUENCY_FILE) -> None:
+    counts: dict[str, int] = {}
+    for tweet in all_tweets.values():
+        handle_id = _normalize_handle(tweet.get("author", ""))
+        if not handle_id:
+            continue
+        counts[handle_id] = counts.get(handle_id, 0) + 1
+
+    with open(destination, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["handle_id", "frequency"])
+        for handle_id, frequency in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+            writer.writerow([handle_id, frequency])
+
+
+def _ingest_visible_tweets(
+    visible_tweets: list[dict],
+    all_tweets: dict,
+    *,
+    anchor_url: str | None = None,
+    first_tweet_this_run: dict | None = None,
+) -> dict:
+    new_count = 0
+    duplicate_count = 0
+    visible_urls = set()
+    anchor_found = False
+    updated_first_tweet = first_tweet_this_run
+
+    for tweet in visible_tweets:
+        text = tweet.get("text", "").strip()
+        author = _normalize_handle(tweet.get("author", ""))
+        url = tweet.get("url", "")
+        if not text:
+            continue
+
+        tweet["author"] = author
+        if url and url != "unknown":
+            visible_urls.add(url)
+
+        if updated_first_tweet is None:
+            updated_first_tweet = tweet
+
+        if anchor_url and url != "unknown" and url == anchor_url:
+            anchor_found = True
+            break
+
+        dedup_key = f"{author}:{text[:80]}"
+        if dedup_key not in all_tweets:
+            all_tweets[dedup_key] = tweet
+            new_count += 1
+        else:
+            duplicate_count += 1
+            existing = all_tweets[dedup_key]
+            existing.update({
+                "author": author or existing.get("author", ""),
+                "author_name": tweet.get("author_name", existing.get("author_name", "")),
+                "url": tweet.get("url", existing.get("url", "")),
+                "posted_at": tweet.get("posted_at", existing.get("posted_at", "")),
+                "replies": tweet.get("replies", existing.get("replies")),
+                "retweets": tweet.get("retweets", existing.get("retweets")),
+                "likes": tweet.get("likes", existing.get("likes")),
+                "impressions": tweet.get("impressions", existing.get("impressions")),
+            })
+
+    return {
+        "new_count": new_count,
+        "duplicate_count": duplicate_count,
+        "visible_urls": visible_urls,
+        "anchor_found": anchor_found,
+        "first_tweet_this_run": updated_first_tweet,
+    }
 
 
 # ─── Challenge / warning detection ──────────────────────────
@@ -403,7 +499,9 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
     pause_max          = config["scrolling"].get("scroll_pause_max", 3.5)
     max_tweets         = config["scrolling"]["max_tweets"]          # first run cap
     max_tweets_anchor  = config["scrolling"].get("max_tweets_anchor", 1000)  # subsequent run cap
-    max_iter           = config["scrolling"]["max_iterations"]
+    max_iter           = config["scrolling"].get("max_iterations", 300)
+    max_session_minutes = float(config["scrolling"].get("max_session_minutes", 18) or 18)
+    stale_round_limit = int(config["scrolling"].get("stale_round_limit", 12) or 12)
 
     anchor_url  = anchor["url"] if anchor else None
     anchor_mode = anchor_url is not None
@@ -414,6 +512,7 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
     anchor_found         = False
     stop_reason          = "max_iterations"
     iterations_completed = 0
+    session_started_at = time.monotonic()
 
     mode_label = f"anchor mode — running until anchor found (cap: {max_tweets_anchor})" if anchor_mode \
                  else f"first run — collecting up to {max_tweets} tweets"
@@ -421,6 +520,13 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
 
     for iteration in range(1, max_iter + 1):
         iterations_completed = iteration
+
+        if max_session_minutes > 0:
+            elapsed_minutes = (time.monotonic() - session_started_at) / 60.0
+            if elapsed_minutes >= max_session_minutes:
+                stop_reason = "session_time_limit"
+                print(f"\n   ⏱️  Session budget reached after {elapsed_minutes:.1f} minutes.")
+                break
 
         # ── Challenge detection (every iteration) ────────────────
         challenge = await check_for_challenge(page)
@@ -436,20 +542,36 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
                 "iterations_completed": iterations_completed,
             }
 
+        # ── Capture before scrolling ─────────────────────────────
+        before_scroll = _ingest_visible_tweets(
+            await read_tweets_from_dom(page),
+            all_tweets,
+            anchor_url=anchor_url,
+            first_tweet_this_run=first_tweet_this_run,
+        )
+        first_tweet_this_run = before_scroll["first_tweet_this_run"]
+        new_this_iter = before_scroll["new_count"]
+        duplicate_this_iter = before_scroll["duplicate_count"]
+        visible_urls = set(before_scroll["visible_urls"])
+        new_count_total += before_scroll["new_count"]
+
+        if before_scroll["anchor_found"]:
+            anchor_found = True
+            stop_reason = "anchor_found"
+            print(f"\n   🔖 Anchor tweet found — run complete.")
+            break
+
         # ── Human-like scroll then extract ───────────────────────
-        # Random mouse nudge before scrolling
         await page.mouse.move(
             random.randint(300, 900),
             random.randint(200, 650),
         )
 
-        # Randomised scroll distance; bigger jump when stale
-        if stale_rounds >= 3:
-            scroll_px = random.randint(1200, 2000)
-        else:
-            scroll_px = random.randint(600, 1200)
-            if random.random() < 0.08:          # 8% chance of a big skip
-                scroll_px = random.randint(1500, 2500)
+        viewport_height = page.viewport_size["height"] if page.viewport_size else 900
+        scroll_px = random.randint(
+            max(int(viewport_height * 0.55), 250),
+            max(int(viewport_height * 0.75), 350),
+        )
 
         await page.mouse.wheel(0, scroll_px)
 
@@ -460,46 +582,23 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
         if random.random() < 0.12:
             await asyncio.sleep(random.uniform(4.0, 9.0))
 
-        # ── Extract tweets from DOM ───────────────────────────────
-        tweets = await read_tweets_from_dom(page)
+        # ── Capture after scrolling ──────────────────────────────
+        after_scroll = _ingest_visible_tweets(
+            await read_tweets_from_dom(page),
+            all_tweets,
+            anchor_url=anchor_url,
+            first_tweet_this_run=first_tweet_this_run,
+        )
+        first_tweet_this_run = after_scroll["first_tweet_this_run"]
+        new_this_iter += after_scroll["new_count"]
+        duplicate_this_iter += after_scroll["duplicate_count"]
+        visible_urls.update(after_scroll["visible_urls"])
+        new_count_total += after_scroll["new_count"]
 
-        new_this_iter = 0
-        for tweet in tweets:
-            text   = tweet.get("text", "").strip()
-            author = tweet.get("author", "").strip()
-            url    = tweet.get("url", "")
-            if not text:
-                continue
-
-            # Record the very first tweet of this run as new anchor candidate
-            if first_tweet_this_run is None:
-                first_tweet_this_run = tweet
-
-            # Stop if we've hit the anchor from the previous run
-            if anchor_mode and url != "unknown" and url == anchor_url:
-                anchor_found = True
-                stop_reason = "anchor_found"
-                print(f"\n   🔖 Anchor tweet found — run complete.")
-                break
-
-            dedup_key = f"{author}:{text[:80]}"
-            if dedup_key not in all_tweets:
-                all_tweets[dedup_key] = tweet
-                new_count_total += 1
-                new_this_iter   += 1
-            else:
-                existing = all_tweets[dedup_key]
-                existing.update({
-                    "author_name": tweet.get("author_name", existing.get("author_name", "")),
-                    "url": tweet.get("url", existing.get("url", "")),
-                    "posted_at": tweet.get("posted_at", existing.get("posted_at", "")),
-                    "replies": tweet.get("replies", existing.get("replies")),
-                    "retweets": tweet.get("retweets", existing.get("retweets")),
-                    "likes": tweet.get("likes", existing.get("likes")),
-                    "impressions": tweet.get("impressions", existing.get("impressions")),
-                })
-
-        if anchor_found:
+        if after_scroll["anchor_found"]:
+            anchor_found = True
+            stop_reason = "anchor_found"
+            print(f"\n   🔖 Anchor tweet found — run complete.")
             break
 
         if new_this_iter > 0:
@@ -508,9 +607,12 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             stale_rounds += 1
 
         total = len(all_tweets)
-        print(f"   [{iteration:3d}/{max_iter}]  +{new_this_iter} new  |  "
-              f"Total: {total}  |  Stale: {stale_rounds}"
-              + (f"  |  Seeking anchor..." if anchor_mode else f"/{max_tweets}"))
+        print(
+            f"   [{iteration:3d}/{max_iter}]  "
+            f"visible={len(visible_urls):2d}  +{new_this_iter:2d} new  "
+            f"dup={duplicate_this_iter:2d}  |  Total: {total}  |  Stale: {stale_rounds}"
+            + (f"  |  Seeking anchor..." if anchor_mode else f"/{max_tweets}")
+        )
 
         # Save progress every 5 iters
         if iteration % 5 == 0:
@@ -529,7 +631,7 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             break
 
         # Safety: too many stale rounds
-        if stale_rounds >= 10:
+        if stale_rounds >= stale_round_limit:
             stop_reason = "stale_rounds"
             print(f"\n   ⏹️  No new tweets for {stale_rounds} rounds. Stopping.")
             break
@@ -540,6 +642,7 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
         "anchor_found": anchor_found,
         "stop_reason": stop_reason,
         "iterations_completed": iterations_completed,
+        "gap_risk": bool(anchor_mode and not anchor_found),
     }
 
 
@@ -1321,6 +1424,7 @@ async def main():
         keys_before    = set(all_tweets.keys())
 
         try:
+            ensure_playwright_node()
             from playwright.async_api import async_playwright
         except ImportError:
             print("\n❌ playwright is not installed.")
@@ -1409,6 +1513,7 @@ async def main():
     print(f"\n   🔍 Scoring {len(run_tweets)} tweets from this run...")
     score_tweets_batch(run_tweets)
     save_tweets(all_tweets)  # persist scores
+    write_handle_frequency_csv(all_tweets)
 
     prefiltered = [t for t in run_tweets if t.get("score", -999) > threshold]
     prefiltered.sort(key=lambda t: t["score"], reverse=True)
@@ -1431,6 +1536,7 @@ async def main():
         "export_only": args.export_only,
         "anchor_mode": scrape_meta.get("anchor_mode"),
         "anchor_found": scrape_meta.get("anchor_found"),
+        "gap_risk": scrape_meta.get("gap_risk", False),
         "stop_reason": scrape_meta.get("stop_reason"),
         "iterations_completed": scrape_meta.get("iterations_completed"),
         "new_tweets": new_count,
@@ -1446,6 +1552,7 @@ async def main():
     print(f"  New tweets this run:  {new_count}")
     print(f"  Total accumulated:    {len(all_list)}")
     print(f"  Matching filter:      {len(scored)}")
+    print(f"  Handle CSV:           {HANDLE_FREQUENCY_FILE}")
     print(f"  Sheet:                {sheet_url}")
     print("=" * 60)
 

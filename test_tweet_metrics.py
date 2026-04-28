@@ -11,7 +11,7 @@ import argparse
 import asyncio
 import json
 
-from scraper import PROFILE_DIR, read_tweets_from_dom, wait_for_timeline_ready
+from scraper import PROFILE_DIR, ensure_playwright_node, read_tweets_from_dom, wait_for_timeline_ready
 from playwright.async_api import async_playwright
 
 
@@ -60,6 +60,8 @@ async def main():
     parser.add_argument("--limit", type=int, default=3, help="Number of visible tweets to print")
     parser.add_argument("--debug", action="store_true", help="Print DOM candidates related to views/impressions")
     args = parser.parse_args()
+
+    ensure_playwright_node()
 
     async with async_playwright() as p:
         PROFILE_DIR.mkdir(exist_ok=True)

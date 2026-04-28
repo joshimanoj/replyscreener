@@ -2,7 +2,9 @@
     "scrolling": {
         "max_tweets": 250,
         "max_tweets_anchor": 1000,
-        "max_iterations": 150,
+        "max_iterations": 300,
+        "max_session_minutes": 18,
+        "stale_round_limit": 12,
         "scroll_pause_min": 1.5,
         "scroll_pause_max": 3.5
     },

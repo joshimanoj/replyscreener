@@ -11,25 +11,14 @@ Recovery heuristic:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-from scraper import SCRIPT_DIR, append_run_history, export_to_gsheets, load_config
-
-
-def _load_last_completed_total() -> int:
-    history_path = SCRIPT_DIR / "run_history.jsonl"
-    if not history_path.exists():
-        return 0
-
-    last_total = 0
-    for line in history_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        record = json.loads(line)
-        if record.get("export_only") is False and "total_accumulated" in record:
-            last_total = int(record["total_accumulated"])
-    return last_total
+from scraper import (
+    SCRIPT_DIR,
+    append_run_history,
+    export_to_gsheets,
+    load_config,
+    load_last_completed_total,
+)
 
 
 def main() -> int:
@@ -39,7 +28,7 @@ def main() -> int:
     else:
         ordered = list(items)
 
-    last_total = _load_last_completed_total()
+    last_total = load_last_completed_total()
     batch = ordered[last_total:]
     processed = [tweet for tweet in batch if "llm_topic_fit_score" in tweet]
     kept = [tweet for tweet in processed if tweet.get("llm_relevant") is True]

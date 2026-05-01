@@ -50,6 +50,24 @@ def load_config():
         return json.load(f)
 
 
+def ensure_supported_runtime() -> None:
+    expected_python = SCRIPT_DIR / "venv" / "bin" / "python"
+    running_python = Path(sys.executable).resolve()
+    expected_version = (3, 13)
+    running_version = sys.version_info[:2]
+
+    if running_python == expected_python.resolve() and running_version == expected_version:
+        return
+
+    if running_version != expected_version or running_python != expected_python.resolve():
+        raise RuntimeError(
+            "Unsupported Python environment.\n"
+            f"   Running:  {running_python} ({sys.version.split()[0]})\n"
+            f"   Expected: {expected_python} (3.13.x)\n"
+            "   Use: ./venv/bin/python scraper.py ..."
+        )
+
+
 def ensure_playwright_node() -> None:
     """
     Playwright normally uses its bundled Node binary, but some installs can miss
@@ -113,6 +131,51 @@ def append_run_history(record: dict) -> None:
     record["recorded_at"] = datetime.now(timezone.utc).isoformat()
     with open(RUN_HISTORY_FILE, "a") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_last_completed_total() -> int:
+    if not RUN_HISTORY_FILE.exists():
+        return 0
+
+    last_total = 0
+    for line in RUN_HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        if record.get("export_only") is False and "total_accumulated" in record:
+            last_total = int(record["total_accumulated"])
+    return last_total
+
+
+def select_resume_last_batch(all_tweets: dict) -> list[dict]:
+    ordered = list(all_tweets.values())
+    last_total = load_last_completed_total()
+    if last_total <= 0:
+        return ordered
+    return ordered[last_total:]
+
+
+def reset_processing_fields(tweets: list[dict]) -> None:
+    derived_fields = (
+        "score",
+        "llm_relevant",
+        "llm_reason",
+        "llm_topic_fit_score",
+        "llm_philosophical_depth_score",
+        "llm_relevance_score",
+        "relevance_score",
+        "freshness_score",
+        "traction_score",
+        "engagement_rate_score",
+        "quote_style",
+        "quote_style_reason",
+        "quote_docked_to_zero",
+        "composite_score",
+    )
+    for tweet in tweets:
+        for field in derived_fields:
+            tweet.pop(field, None)
 
 
 def write_handle_frequency_csv(all_tweets: dict, destination: Path = HANDLE_FREQUENCY_FILE) -> None:
@@ -402,7 +465,13 @@ async def read_tweets_from_dom(page) -> list[dict]:
                 return getMetricFromGroupLabel(article, labels);
             };
 
-            const articles = document.querySelectorAll('article[data-testid="tweet"]');
+            const primary = document.querySelector('[data-testid="primaryColumn"]') || document;
+            const viewportTopBuffer = -250;
+            const viewportBottomBuffer = (window.innerHeight || 900) + 350;
+            const articles = Array.from(primary.querySelectorAll('article[data-testid="tweet"]')).filter(article => {
+                const rect = article.getBoundingClientRect();
+                return rect.bottom >= viewportTopBuffer && rect.top <= viewportBottomBuffer;
+            });
             const results = [];
 
             for (const article of articles) {
@@ -451,6 +520,175 @@ async def read_tweets_from_dom(page) -> list[dict]:
     """)
 
 
+async def read_scroll_snapshot(page) -> dict:
+    return await page.evaluate("""
+        () => {
+            const primary = document.querySelector('[data-testid="primaryColumn"]') || document;
+            const allArticles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            const mountedArticles = Array.from(primary.querySelectorAll('article[data-testid="tweet"]'));
+            const viewportTopBuffer = -250;
+            const viewportBottomBuffer = (window.innerHeight || 900) + 350;
+            const articles = mountedArticles.filter(article => {
+                const rect = article.getBoundingClientRect();
+                return rect.bottom >= viewportTopBuffer && rect.top <= viewportBottomBuffer;
+            });
+            const articleSummaries = articles.slice(0, 4).map(article => {
+                const rect = article.getBoundingClientRect();
+                const timeEl = article.querySelector('time');
+                const link = timeEl ? timeEl.closest('a') : null;
+                const text = article.querySelector('[data-testid="tweetText"]')?.innerText?.trim() || '';
+                return {
+                    url: link ? `https://x.com${link.getAttribute('href')}` : '',
+                    top: Math.round(rect.top),
+                    height: Math.round(rect.height),
+                    textLen: text.length,
+                };
+            });
+            const urls = articles.map(article => {
+                const timeEl = article.querySelector('time');
+                const link = timeEl ? timeEl.closest('a') : null;
+                return link ? `https://x.com${link.getAttribute('href')}` : '';
+            }).filter(url => url && url !== 'unknown');
+            return {
+                y: Math.round(window.scrollY || 0),
+                innerHeight: Math.round(window.innerHeight || 0),
+                scrollHeight: Math.round(document.documentElement.scrollHeight || document.body.scrollHeight || 0),
+                allArticleCount: allArticles.length,
+                mountedArticleCount: mountedArticles.length,
+                articleCount: articles.length,
+                uniqueUrlCount: new Set(urls).size,
+                firstUrl: urls[0] || '',
+                lastUrl: urls[urls.length - 1] || '',
+                articles: articleSummaries,
+            };
+        }
+    """)
+
+
+def _short_url(url: str) -> str:
+    if not url:
+        return "-"
+    return url.rsplit("/", 1)[-1][-8:]
+
+
+def _known_url_count(tweets: list[dict]) -> int:
+    return sum(1 for tweet in tweets if tweet.get("url") and tweet.get("url") != "unknown")
+
+
+def _article_height_summary(snapshot: dict) -> str:
+    articles = snapshot.get("articles") or []
+    if not articles:
+        return "-"
+    return ",".join(
+        f"{_short_url(article.get('url', ''))}@{article.get('top', 0)}h{article.get('height', 0)}"
+        for article in articles
+    )
+
+
+def _empty_scrape_health() -> dict:
+    return {
+        "iterations": 0,
+        "new_tweets": 0,
+        "duplicates": 0,
+        "extracted": 0,
+        "known_urls": 0,
+        "unique_visible_urls": set(),
+        "zero_new_rounds": 0,
+        "low_motion_rounds": 0,
+        "visible_articles": 0,
+        "mounted_articles": 0,
+    }
+
+
+def _record_scrape_health(
+    health: dict,
+    *,
+    before_tweets: list[dict],
+    after_tweets: list[dict],
+    before_scroll: dict,
+    after_scroll: dict,
+    before_snapshot: dict,
+    after_snapshot: dict,
+    new_this_iter: int,
+    duplicate_this_iter: int,
+    scroll_delta: int,
+) -> None:
+    health["iterations"] += 1
+    health["new_tweets"] += new_this_iter
+    health["duplicates"] += duplicate_this_iter
+    health["extracted"] += len(before_tweets) + len(after_tweets)
+    health["known_urls"] += _known_url_count(before_tweets) + _known_url_count(after_tweets)
+    health["unique_visible_urls"].update(before_scroll.get("visible_urls", set()))
+    health["unique_visible_urls"].update(after_scroll.get("visible_urls", set()))
+    health["visible_articles"] += int(before_snapshot.get("articleCount", 0) or 0)
+    health["visible_articles"] += int(after_snapshot.get("articleCount", 0) or 0)
+    health["mounted_articles"] += int(before_snapshot.get("mountedArticleCount", 0) or 0)
+    health["mounted_articles"] += int(after_snapshot.get("mountedArticleCount", 0) or 0)
+    if new_this_iter == 0:
+        health["zero_new_rounds"] += 1
+    if abs(scroll_delta) < 100:
+        health["low_motion_rounds"] += 1
+
+
+def _finalize_scrape_health(health: dict, *, anchor_mode: bool, anchor_found: bool, stop_reason: str) -> dict:
+    iterations = max(int(health.get("iterations", 0) or 0), 1)
+    extracted = max(int(health.get("extracted", 0) or 0), 1)
+    mounted_articles = max(int(health.get("mounted_articles", 0) or 0), 1)
+    unique_visible_urls = health.get("unique_visible_urls", set())
+    if not isinstance(unique_visible_urls, set):
+        unique_visible_urls = set(unique_visible_urls or [])
+
+    summary = {
+        "status": "ok",
+        "warnings": [],
+        "iterations": int(health.get("iterations", 0) or 0),
+        "new_tweets": int(health.get("new_tweets", 0) or 0),
+        "duplicates": int(health.get("duplicates", 0) or 0),
+        "unique_visible_urls": len(unique_visible_urls),
+        "new_per_scroll": round(float(health.get("new_tweets", 0) or 0) / iterations, 3),
+        "unique_urls_per_scroll": round(len(unique_visible_urls) / iterations, 3),
+        "zero_new_round_rate": round(float(health.get("zero_new_rounds", 0) or 0) / iterations, 3),
+        "url_missing_rate": round(1.0 - (float(health.get("known_urls", 0) or 0) / extracted), 3),
+        "duplicate_rate": round(float(health.get("duplicates", 0) or 0) / extracted, 3),
+        "low_motion_round_rate": round(float(health.get("low_motion_rounds", 0) or 0) / iterations, 3),
+        "mounted_visible_ratio": round(mounted_articles / max(float(health.get("visible_articles", 0) or 0), 1.0), 3),
+    }
+
+    if summary["iterations"] >= 30 and summary["new_per_scroll"] < 0.8:
+        summary["warnings"].append("low_new_per_scroll")
+    if summary["iterations"] >= 30 and summary["unique_urls_per_scroll"] < 1.0:
+        summary["warnings"].append("low_unique_urls_per_scroll")
+    if summary["iterations"] >= 20 and summary["zero_new_round_rate"] > 0.25:
+        summary["warnings"].append("many_zero_new_rounds")
+    if summary["url_missing_rate"] > 0.35:
+        summary["warnings"].append("high_url_missing_rate")
+    if summary["low_motion_round_rate"] > 0.05:
+        summary["warnings"].append("scroll_not_moving_reliably")
+    if summary["mounted_visible_ratio"] > 4.0:
+        summary["warnings"].append("many_offscreen_mounted_articles")
+    if anchor_mode and not anchor_found:
+        summary["warnings"].append(f"anchor_not_found:{stop_reason}")
+
+    if summary["warnings"]:
+        summary["status"] = "degraded"
+    return summary
+
+
+def print_scrape_health(summary: dict) -> None:
+    status = summary.get("status", "unknown")
+    icon = "✅" if status == "ok" else "⚠️"
+    print(
+        f"   {icon} Feed health: {status.upper()} "
+        f"(new/scroll={summary.get('new_per_scroll', 0):.2f}, "
+        f"unique/scroll={summary.get('unique_urls_per_scroll', 0):.2f}, "
+        f"zero-new={summary.get('zero_new_round_rate', 0):.0%}, "
+        f"url-missing={summary.get('url_missing_rate', 0):.0%})"
+    )
+    warnings = summary.get("warnings") or []
+    if warnings:
+        print(f"      Warnings: {', '.join(warnings)}")
+
+
 async def wait_for_timeline_ready(page, timeout_ms: int = 120000) -> bool:
     """
     Wait until the X home timeline is visibly loaded enough for scraping.
@@ -497,6 +735,8 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
     """
     pause_min          = config["scrolling"].get("scroll_pause_min", 1.5)
     pause_max          = config["scrolling"].get("scroll_pause_max", 3.5)
+    scroll_min_viewports = float(config["scrolling"].get("scroll_min_viewports", 1.05) or 1.05)
+    scroll_max_viewports = float(config["scrolling"].get("scroll_max_viewports", 1.35) or 1.35)
     max_tweets         = config["scrolling"]["max_tweets"]          # first run cap
     max_tweets_anchor  = config["scrolling"].get("max_tweets_anchor", 1000)  # subsequent run cap
     max_iter           = config["scrolling"].get("max_iterations", 300)
@@ -513,6 +753,7 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
     stop_reason          = "max_iterations"
     iterations_completed = 0
     session_started_at = time.monotonic()
+    scrape_health = _empty_scrape_health()
 
     mode_label = f"anchor mode — running until anchor found (cap: {max_tweets_anchor})" if anchor_mode \
                  else f"first run — collecting up to {max_tweets} tweets"
@@ -543,8 +784,10 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             }
 
         # ── Capture before scrolling ─────────────────────────────
+        before_snapshot = await read_scroll_snapshot(page)
+        before_tweets = await read_tweets_from_dom(page)
         before_scroll = _ingest_visible_tweets(
-            await read_tweets_from_dom(page),
+            before_tweets,
             all_tweets,
             anchor_url=anchor_url,
             first_tweet_this_run=first_tweet_this_run,
@@ -569,8 +812,8 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
 
         viewport_height = page.viewport_size["height"] if page.viewport_size else 900
         scroll_px = random.randint(
-            max(int(viewport_height * 0.55), 250),
-            max(int(viewport_height * 0.75), 350),
+            max(int(viewport_height * scroll_min_viewports), 250),
+            max(int(viewport_height * scroll_max_viewports), 350),
         )
 
         await page.mouse.wheel(0, scroll_px)
@@ -583,8 +826,10 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             await asyncio.sleep(random.uniform(4.0, 9.0))
 
         # ── Capture after scrolling ──────────────────────────────
+        after_snapshot = await read_scroll_snapshot(page)
+        after_tweets = await read_tweets_from_dom(page)
         after_scroll = _ingest_visible_tweets(
-            await read_tweets_from_dom(page),
+            after_tweets,
             all_tweets,
             anchor_url=anchor_url,
             first_tweet_this_run=first_tweet_this_run,
@@ -607,10 +852,29 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             stale_rounds += 1
 
         total = len(all_tweets)
+        scroll_delta = int(after_snapshot.get("y", 0) or 0) - int(before_snapshot.get("y", 0) or 0)
+        _record_scrape_health(
+            scrape_health,
+            before_tweets=before_tweets,
+            after_tweets=after_tweets,
+            before_scroll=before_scroll,
+            after_scroll=after_scroll,
+            before_snapshot=before_snapshot,
+            after_snapshot=after_snapshot,
+            new_this_iter=new_this_iter,
+            duplicate_this_iter=duplicate_this_iter,
+            scroll_delta=scroll_delta,
+        )
         print(
             f"   [{iteration:3d}/{max_iter}]  "
-            f"visible={len(visible_urls):2d}  +{new_this_iter:2d} new  "
+            f"visible={before_snapshot.get('articleCount', 0):2d}->{after_snapshot.get('articleCount', 0):2d}"
+            f"/mounted={before_snapshot.get('mountedArticleCount', 0):2d}->{after_snapshot.get('mountedArticleCount', 0):2d} "
+            f"extracted={len(before_tweets):2d}->{len(after_tweets):2d} "
+            f"uniq={len(visible_urls):2d}  +{new_this_iter:2d} new  "
             f"dup={duplicate_this_iter:2d}  |  Total: {total}  |  Stale: {stale_rounds}"
+            f"  |  yΔ={scroll_delta:4d} y={after_snapshot.get('y', 0)}"
+            f"  |  first/last={_short_url(after_snapshot.get('firstUrl', ''))}/{_short_url(after_snapshot.get('lastUrl', ''))}"
+            f"  |  articles={_article_height_summary(after_snapshot)}"
             + (f"  |  Seeking anchor..." if anchor_mode else f"/{max_tweets}")
         )
 
@@ -636,6 +900,14 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
             print(f"\n   ⏹️  No new tweets for {stale_rounds} rounds. Stopping.")
             break
 
+    health_summary = _finalize_scrape_health(
+        scrape_health,
+        anchor_mode=anchor_mode,
+        anchor_found=anchor_found,
+        stop_reason=stop_reason,
+    )
+    print_scrape_health(health_summary)
+
     save_tweets(all_tweets)
     return new_count_total, first_tweet_this_run, {
         "anchor_mode": anchor_mode,
@@ -643,6 +915,94 @@ async def agent_loop(page, config, all_tweets: dict, anchor: dict | None):
         "stop_reason": stop_reason,
         "iterations_completed": iterations_completed,
         "gap_risk": bool(anchor_mode and not anchor_found),
+        "scrape_health": health_summary,
+    }
+
+
+async def scrape_diagnostics_loop(page, config: dict, all_tweets: dict, iterations: int) -> dict:
+    """
+    Short, non-destructive scrape probe. It uses a copy of saved tweets so we can
+    measure would-be new/duplicate extraction without changing production state.
+    """
+    probe_tweets = dict(all_tweets)
+    pause_min = config["scrolling"].get("scroll_pause_min", 1.5)
+    pause_max = config["scrolling"].get("scroll_pause_max", 3.5)
+    scroll_min_viewports = float(config["scrolling"].get("scroll_min_viewports", 1.05) or 1.05)
+    scroll_max_viewports = float(config["scrolling"].get("scroll_max_viewports", 1.35) or 1.35)
+    iterations = max(1, iterations)
+    new_total = 0
+    duplicate_total = 0
+    zero_new_rounds = 0
+    low_motion_rounds = 0
+    unique_urls_seen: set[str] = set()
+    last_snapshot = {}
+
+    print(f"\n🧪 Scrape diagnostics starting ({iterations} scrolls, no files/sheets updated)\n")
+
+    for iteration in range(1, iterations + 1):
+        challenge = await check_for_challenge(page)
+        if challenge:
+            print(f"\n   ⚠️  CHALLENGE DETECTED during diagnostics: '{challenge}'")
+            return {
+                "stop_reason": "challenge_detected",
+                "iterations_completed": iteration,
+                "new_tweets": new_total,
+                "duplicates": duplicate_total,
+            }
+
+        before_snapshot = await read_scroll_snapshot(page)
+        before_tweets = await read_tweets_from_dom(page)
+        before = _ingest_visible_tweets(before_tweets, probe_tweets)
+        unique_urls_seen.update(before["visible_urls"])
+
+        viewport_height = page.viewport_size["height"] if page.viewport_size else 900
+        scroll_px = random.randint(
+            max(int(viewport_height * scroll_min_viewports), 250),
+            max(int(viewport_height * scroll_max_viewports), 350),
+        )
+        await page.mouse.move(random.randint(300, 900), random.randint(200, 650))
+        await page.mouse.wheel(0, scroll_px)
+        await asyncio.sleep(random.uniform(pause_min, pause_max))
+
+        after_snapshot = await read_scroll_snapshot(page)
+        after_tweets = await read_tweets_from_dom(page)
+        after = _ingest_visible_tweets(after_tweets, probe_tweets)
+        unique_urls_seen.update(after["visible_urls"])
+
+        new_this_iter = before["new_count"] + after["new_count"]
+        duplicate_this_iter = before["duplicate_count"] + after["duplicate_count"]
+        new_total += new_this_iter
+        duplicate_total += duplicate_this_iter
+        if new_this_iter == 0:
+            zero_new_rounds += 1
+        scroll_delta = int(after_snapshot.get("y", 0) or 0) - int(before_snapshot.get("y", 0) or 0)
+        if abs(scroll_delta) < 100:
+            low_motion_rounds += 1
+        last_snapshot = after_snapshot
+
+        print(
+            f"   [{iteration:2d}/{iterations}] "
+            f"visible={before_snapshot.get('articleCount', 0):2d}->{after_snapshot.get('articleCount', 0):2d}"
+            f"/mounted={before_snapshot.get('mountedArticleCount', 0):2d}->{after_snapshot.get('mountedArticleCount', 0):2d} "
+            f"extracted={len(before_tweets):2d}->{len(after_tweets):2d} "
+            f"urls={_known_url_count(before_tweets):2d}->{_known_url_count(after_tweets):2d} "
+            f"uniq_iter={len(before['visible_urls'] | after['visible_urls']):2d} "
+            f"+{new_this_iter:2d} new dup={duplicate_this_iter:2d} "
+            f"yΔ={scroll_delta:4d} y={after_snapshot.get('y', 0)} "
+            f"first/last={_short_url(after_snapshot.get('firstUrl', ''))}/{_short_url(after_snapshot.get('lastUrl', ''))}"
+            f" articles={_article_height_summary(after_snapshot)}"
+        )
+
+    return {
+        "stop_reason": "diagnostic_complete",
+        "iterations_completed": iterations,
+        "new_tweets": new_total,
+        "duplicates": duplicate_total,
+        "unique_visible_urls": len(unique_urls_seen),
+        "zero_new_rounds": zero_new_rounds,
+        "low_motion_rounds": low_motion_rounds,
+        "last_scroll_y": last_snapshot.get("y", 0),
+        "last_scroll_height": last_snapshot.get("scrollHeight", 0),
     }
 
 
@@ -704,14 +1064,53 @@ SKIP_EXEMPLARS = [
 ]
 
 _model     = None
+_tokenizer = None
+_device    = None
 _keep_embs = None
 _skip_embs = None
 
 
-def _load_model():
-    global _model, _keep_embs, _skip_embs, _lang_detect, LangDetectException
+def _current_scoring_mode() -> str:
     if _model is not None:
-        return
+        return "semantic"
+    return "unknown"
+
+
+def _effective_prefilter_threshold(config: dict) -> tuple[float, str]:
+    filtering_cfg = config.get("filtering", {})
+    semantic_threshold = filtering_cfg.get("semantic_threshold", PREFILTER_THRESHOLD)
+    return float(semantic_threshold), _current_scoring_mode()
+
+
+def _mean_pool(last_hidden_state, attention_mask):
+    expanded_mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+    pooled = (last_hidden_state * expanded_mask).sum(dim=1)
+    counts = expanded_mask.sum(dim=1).clamp(min=1e-9)
+    return pooled / counts
+
+
+def _encode_texts(texts: list[str]):
+    import torch
+
+    encoded = _tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=256,
+        return_tensors="pt",
+    )
+    encoded = {key: value.to(_device) for key, value in encoded.items()}
+    with torch.inference_mode():
+        outputs = _model(**encoded)
+        pooled = _mean_pool(outputs.last_hidden_state, encoded["attention_mask"])
+        normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+    return normalized
+
+
+def _load_model():
+    global _model, _tokenizer, _device, _keep_embs, _skip_embs, _lang_detect, LangDetectException
+    if _model is not None:
+        return True
     if _lang_detect is None:
         try:
             from langdetect import detect as _detect
@@ -723,29 +1122,55 @@ def _load_model():
         _lang_detect = _detect
         LangDetectException = _LangDetectException
     try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        print("\n❌ sentence-transformers not installed.")
-        print("   pip install sentence-transformers\n")
-        raise
-    print("   🧠 Loading semantic model (first call only)...")
-    import transformers; transformers.logging.set_verbosity_error()
-    _model     = SentenceTransformer("all-mpnet-base-v2")
-    _keep_embs = _model.encode(KEEP_EXEMPLARS, convert_to_tensor=True)
-    _skip_embs = _model.encode(SKIP_EXEMPLARS, convert_to_tensor=True)
-    print("   ✅ Model ready.\n")
+        import torch
+        import transformers
+        from transformers import AutoModel, AutoTokenizer
+    except ImportError as exc:
+        print("\n   ❌ Semantic scorer dependencies are unavailable.")
+        print(f"   Reason: {exc}\n")
+        raise RuntimeError(
+            "Semantic prefilter model could not run because dependencies are missing. "
+            "Keyword fallback is disabled; fix the model environment and rerun."
+        ) from exc
+
+    transformers.logging.set_verbosity_error()
+    model_name = "sentence-transformers/all-mpnet-base-v2"
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            print(f"   🧠 Loading semantic model (attempt {attempt}/3)...")
+            _device = "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
+            _tokenizer = AutoTokenizer.from_pretrained(model_name)
+            _model = AutoModel.from_pretrained(model_name).to(_device)
+            _model.eval()
+            _keep_embs = _encode_texts(KEEP_EXEMPLARS)
+            _skip_embs = _encode_texts(SKIP_EXEMPLARS)
+            print("   ✅ Model ready.\n")
+            return True
+        except Exception as exc:
+            last_exc = exc
+            _model = None
+            _tokenizer = None
+            _keep_embs = None
+            _skip_embs = None
+            print(f"   ⚠️  Semantic model load failed on attempt {attempt}/3: {exc}")
+            if attempt < 3:
+                time.sleep(2)
+
+    print("\n   ❌ Semantic model failed after 3 attempts.")
+    print("   Keyword fallback is disabled; stopping so we can fix the model instead of silently degrading.\n")
+    raise RuntimeError("Semantic prefilter model failed to load after 3 attempts.") from last_exc
 
 
-def score_tweets_batch(tweets: list[dict], **_) -> None:
+def score_tweets_batch(tweets: list[dict], **_) -> str:
     """Score all unscored tweets in-place using the local mpnet model."""
     to_score = [t for t in tweets if "score" not in t]
     if not to_score:
-        return
+        return _current_scoring_mode()
 
     _load_model()
-    from sentence_transformers import util as st_util
 
-    print(f"   🧠 Scoring {len(to_score)} tweets locally...")
+    print(f"   🧠 Scoring {len(to_score)} tweets locally (semantic)...")
     for tweet in to_score:
         text = tweet.get("text", "")
         if len(text.strip()) < MIN_TWEET_LENGTH:
@@ -758,10 +1183,11 @@ def score_tweets_batch(tweets: list[dict], **_) -> None:
         if lang != "en":
             tweet["score"] = -999.0
             continue
-        emb            = _model.encode(text, convert_to_tensor=True)
-        keep_score     = float(st_util.cos_sim(emb, _keep_embs).max())
-        skip_score     = float(st_util.cos_sim(emb, _skip_embs).max())
+        emb = _encode_texts([text])
+        keep_score = float((emb @ _keep_embs.T).max().item())
+        skip_score = float((emb @ _skip_embs.T).max().item())
         tweet["score"] = keep_score - skip_score
+    return "semantic"
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -1376,15 +1802,27 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--export-only", action="store_true",
                         help="Skip scraping - score, filter, and export existing tweets")
+    parser.add_argument("--resume-last-batch", action="store_true",
+                        help="Skip scraping and process only tweets added after the last completed run")
     parser.add_argument("--rank-sheet-only", action="store_true",
                         help="Skip scraping/mpnet and rerun Phi-3 ranking on the current Google Sheet rows")
     parser.add_argument("--sheet-gid",
                         help="Optional Google Sheets gid to read for --rank-sheet-only")
+    parser.add_argument("--scrape-diagnostics", type=int, metavar="SCROLLS",
+                        help="Run a short non-destructive scrape probe and skip filtering/export")
     args = parser.parse_args()
+
+    if args.export_only and args.resume_last_batch:
+        parser.error("--export-only and --resume-last-batch cannot be used together")
+    if args.scrape_diagnostics and (args.export_only or args.resume_last_batch or args.rank_sheet_only):
+        parser.error("--scrape-diagnostics cannot be combined with export/rank/resume modes")
+
+    ensure_supported_runtime()
 
     config     = load_config()
     anchor     = load_anchor()
     all_tweets = load_saved_tweets()
+    first_tweet = None
 
     print("=" * 60)
     print("  🐦 Twitter Scraper — DOM Edition")
@@ -1400,7 +1838,7 @@ async def main():
         print("=" * 60)
         return
 
-    # ── Scraping phase (skipped with --export-only) ───────────────
+    # ── Scraping phase (skipped with --export-only / --resume-last-batch) ─────
     if args.export_only:
         print(f"  Mode:    EXPORT ONLY (using {len(all_tweets)} saved tweets)")
         print("=" * 60)
@@ -1410,6 +1848,19 @@ async def main():
             "anchor_mode": bool(anchor),
             "anchor_found": None,
             "stop_reason": "export_only",
+            "iterations_completed": 0,
+        }
+    elif args.resume_last_batch:
+        resume_tweets = select_resume_last_batch(all_tweets)
+        reset_processing_fields(resume_tweets)
+        print(f"  Mode:    RESUME LAST BATCH ({len(resume_tweets)} saved tweets since last completed run)")
+        print("=" * 60)
+        new_count = len(resume_tweets)
+        new_tweet_keys = set()
+        scrape_meta = {
+            "anchor_mode": bool(anchor),
+            "anchor_found": None,
+            "stop_reason": "resume_last_batch",
             "iterations_completed": 0,
         }
     else:
@@ -1477,6 +1928,27 @@ async def main():
             print("\n   ✅ Timeline detected. Taking over...\n")
             await asyncio.sleep(random.uniform(2.5, 4.5))   # human landing pause
 
+            if args.scrape_diagnostics:
+                diagnostic_meta = await scrape_diagnostics_loop(
+                    page,
+                    config,
+                    all_tweets,
+                    iterations=args.scrape_diagnostics,
+                )
+                print("\n" + "=" * 60)
+                print("  🧪 Scrape Diagnostics Summary")
+                print(f"  Iterations:          {diagnostic_meta.get('iterations_completed')}")
+                print(f"  Would-be new tweets: {diagnostic_meta.get('new_tweets')}")
+                print(f"  Duplicates seen:     {diagnostic_meta.get('duplicates')}")
+                print(f"  Unique visible URLs: {diagnostic_meta.get('unique_visible_urls')}")
+                print(f"  Zero-new rounds:     {diagnostic_meta.get('zero_new_rounds')}")
+                print(f"  Low-motion rounds:   {diagnostic_meta.get('low_motion_rounds')}")
+                print(f"  Last scroll y/height:{diagnostic_meta.get('last_scroll_y')} / {diagnostic_meta.get('last_scroll_height')}")
+                print("  Files updated:       no")
+                print("=" * 60)
+                await context.close()
+                return
+
             new_count, first_tweet, scrape_meta = await agent_loop(page, config, all_tweets, anchor)
 
             # Update anchor to the first tweet seen this run
@@ -1500,8 +1972,11 @@ async def main():
 
     # In a normal run: process only new tweets collected this session.
     # In --export-only: no scraping happened, so fall back to all saved tweets.
+    # In --resume-last-batch: process only the interrupted batch slice.
     if args.export_only:
         run_tweets = all_list
+    elif args.resume_last_batch:
+        run_tweets = resume_tweets
     else:
         run_tweets = [all_tweets[k] for k in new_tweet_keys if k in all_tweets]
 
@@ -1509,11 +1984,12 @@ async def main():
     filter_model = llm_filter_cfg.get("model", "phi3:mini")
 
     # ── Stage 1: mpnet pre-filter (loose) ────────────────────────
-    threshold = config.get("filtering", {}).get("semantic_threshold", PREFILTER_THRESHOLD)
     print(f"\n   🔍 Scoring {len(run_tweets)} tweets from this run...")
     score_tweets_batch(run_tweets)
     save_tweets(all_tweets)  # persist scores
     write_handle_frequency_csv(all_tweets)
+
+    threshold, _threshold_mode = _effective_prefilter_threshold(config)
 
     prefiltered = [t for t in run_tweets if t.get("score", -999) > threshold]
     prefiltered.sort(key=lambda t: t["score"], reverse=True)
@@ -1534,6 +2010,7 @@ async def main():
     append_run_history({
         "run_ts": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "export_only": args.export_only,
+        "resume_last_batch": args.resume_last_batch,
         "anchor_mode": scrape_meta.get("anchor_mode"),
         "anchor_found": scrape_meta.get("anchor_found"),
         "gap_risk": scrape_meta.get("gap_risk", False),
@@ -1544,6 +2021,7 @@ async def main():
         "matching_filter": len(scored),
         "old_anchor_url": anchor.get("url", "") if anchor else "",
         "new_anchor_url": first_tweet.get("url", "") if not args.export_only and first_tweet else "",
+        "scrape_health": scrape_meta.get("scrape_health", {}),
         "sheet_url": sheet_url,
     })
 
@@ -1552,6 +2030,10 @@ async def main():
     print(f"  New tweets this run:  {new_count}")
     print(f"  Total accumulated:    {len(all_list)}")
     print(f"  Matching filter:      {len(scored)}")
+    if scrape_meta.get("scrape_health"):
+        health = scrape_meta["scrape_health"]
+        print(f"  Feed health:          {health.get('status', 'unknown')} "
+              f"(new/scroll={health.get('new_per_scroll', 0):.2f})")
     print(f"  Handle CSV:           {HANDLE_FREQUENCY_FILE}")
     print(f"  Sheet:                {sheet_url}")
     print("=" * 60)

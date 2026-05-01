@@ -19,15 +19,20 @@ Automated Twitter timeline scraper that collects tweets, filters them by custom 
 
 ## Setup
 
-1. Install dependencies: `pip install -r requirements.txt`
-2. Install Playwright: `playwright install chromium`
-3. Install Ollama and pull a local model such as `phi3:mini`; the scraper starts `ollama serve` automatically when needed
-4. Configure `config.json` with Twitter and Google Sheets settings
-5. Run: `python scraper.py`
+1. Create a Python 3.13 virtualenv: `python3.13 -m venv venv`
+2. Install dependencies: `./venv/bin/python -m pip install -r requirements.txt`
+3. Install Playwright: `./venv/bin/playwright install chromium`
+4. Install Ollama and pull a local model such as `phi3:mini`; the scraper starts `ollama serve` automatically when needed
+5. Configure `config.json` with Twitter and Google Sheets settings
+6. Run: `./venv/bin/python scraper.py`
 
 To repair an existing sheet when a run skipped local LLM ranking:
 
 `python scraper.py --rank-sheet-only --sheet-gid 1619977557`
+
+To resume an interrupted run from the scraped-but-not-filtered batch only:
+
+`python scraper.py --resume-last-batch`
 
 ## Evaluate A Sample File
 

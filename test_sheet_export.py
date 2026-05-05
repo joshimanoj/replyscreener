@@ -9,7 +9,11 @@ Google Sheets link.
 
 from __future__ import annotations
 
+import unittest
+from unittest import mock
+
 from scraper import export_to_gsheets, load_config, load_saved_tweets
+import scraper
 
 
 def build_test_row() -> dict:
@@ -50,6 +54,27 @@ def main() -> int:
     url = export_to_gsheets([build_test_row()], config)
     print(url)
     return 0
+
+
+class GoogleSheetsRetryTests(unittest.TestCase):
+    def test_retries_transient_api_error_string_shape(self):
+        calls = []
+
+        def flaky_call():
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("APIError: [500]: Internal error encountered.")
+            return "ok"
+
+        with (
+            mock.patch.object(scraper, "GSHEETS_MAX_ATTEMPTS", 3),
+            mock.patch.object(scraper.time, "sleep"),
+            mock.patch.object(scraper.random, "uniform", return_value=0.0),
+        ):
+            result = scraper._gsheets_call_with_retry("test call", flaky_call)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(calls), 3)
 
 
 if __name__ == "__main__":

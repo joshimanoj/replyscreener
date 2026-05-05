@@ -21,6 +21,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -1582,6 +1583,10 @@ GSHEETS_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+GSHEETS_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+GSHEETS_MAX_ATTEMPTS = 5
+GSHEETS_RETRY_BASE_SECONDS = 2.0
+
 
 def _gspread_client(credentials_file: str):
     try:
@@ -1593,41 +1598,98 @@ def _gspread_client(credentials_file: str):
     return gspread.authorize(creds)
 
 
+def _gsheets_error_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    for attr in ("status_code", "status"):
+        status = getattr(response, attr, None)
+        if isinstance(status, int):
+            return status
+        if isinstance(status, str) and status.isdigit():
+            return int(status)
+
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+
+    match = re.search(r"\[(\d{3})\]", str(exc))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _gsheets_call_with_retry(description: str, func, *args, **kwargs):
+    for attempt in range(1, GSHEETS_MAX_ATTEMPTS + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            status = _gsheets_error_status(exc)
+            if status not in GSHEETS_RETRYABLE_STATUSES or attempt == GSHEETS_MAX_ATTEMPTS:
+                raise
+
+            delay = min(GSHEETS_RETRY_BASE_SECONDS * (2 ** (attempt - 1)), 30.0)
+            delay += random.uniform(0.0, 1.0)
+            print(
+                f"   ⚠️  Google Sheets {description} failed with HTTP {status}; "
+                f"retrying in {delay:.1f}s ({attempt}/{GSHEETS_MAX_ATTEMPTS})..."
+            )
+            time.sleep(delay)
+
+
+def _is_gspread_worksheet_not_found(exc: Exception) -> bool:
+    return exc.__class__.__name__ == "WorksheetNotFound"
+
+
 def _get_gsheets_client_and_sheet(config: dict):
     gs_cfg           = config["google_sheets"]
     spreadsheet_id   = gs_cfg["spreadsheet_id"]
     credentials_file = str(SCRIPT_DIR / gs_cfg["credentials_file"])
     gc = _gspread_client(credentials_file)
-    sh = gc.open_by_key(spreadsheet_id)
+    sh = _gsheets_call_with_retry("open_by_key", gc.open_by_key, spreadsheet_id)
     return sh, spreadsheet_id
 
 
 def _prepare_ranked_worksheet(sh, worksheet_title: str, rows: int, cols: int):
     try:
-        ws = sh.worksheet(worksheet_title)
-        ws.clear()
-        if ws.row_count < rows or ws.col_count < cols:
-            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols))
-    except Exception:
-        ws = sh.add_worksheet(title=worksheet_title, rows=rows, cols=cols)
+        ws = _gsheets_call_with_retry("worksheet lookup", sh.worksheet, worksheet_title)
+    except Exception as exc:
+        if not _is_gspread_worksheet_not_found(exc):
+            raise
+        ws = _gsheets_call_with_retry(
+            "add worksheet",
+            sh.add_worksheet,
+            title=worksheet_title,
+            rows=rows,
+            cols=cols,
+        )
 
-    for stale_ws in list(sh.worksheets()):
+    _gsheets_call_with_retry("clear worksheet", ws.clear)
+    if ws.row_count < rows or ws.col_count < cols:
+        _gsheets_call_with_retry(
+            "resize worksheet",
+            ws.resize,
+            rows=max(ws.row_count, rows),
+            cols=max(ws.col_count, cols),
+        )
+
+    for stale_ws in list(_gsheets_call_with_retry("list worksheets", sh.worksheets)):
         if stale_ws.id == ws.id:
             continue
         if stale_ws.title.startswith("Run_") or stale_ws.title.startswith("New_"):
-            sh.del_worksheet(stale_ws)
+            _gsheets_call_with_retry("delete stale worksheet", sh.del_worksheet, stale_ws)
 
     return ws
 
 
 def _worksheet_from_config_or_gid(sh, config: dict, gid: str | None = None):
     if gid:
-        for ws in sh.worksheets():
+        for ws in _gsheets_call_with_retry("list worksheets", sh.worksheets):
             if str(ws.id) == str(gid):
                 return ws
         raise RuntimeError(f"No worksheet found with gid={gid}")
     worksheet_title = config.get("google_sheets", {}).get("worksheet_title", "Filtered Ranked Tweets")
-    return sh.worksheet(worksheet_title)
+    return _gsheets_call_with_retry("worksheet lookup", sh.worksheet, worksheet_title)
 
 
 def _num(value, default=0.0):
@@ -1648,7 +1710,7 @@ def _bool_value(value) -> bool:
 def load_ranked_sheet_tweets(config: dict, gid: str | None = None) -> tuple[list[dict], str]:
     sh, spreadsheet_id = _get_gsheets_client_and_sheet(config)
     ws = _worksheet_from_config_or_gid(sh, config, gid)
-    values = ws.get_all_values()
+    values = _gsheets_call_with_retry("read worksheet values", ws.get_all_values)
     if not values:
         return [], f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}"
 
@@ -1705,7 +1767,7 @@ def export_to_gsheets(tweets: list[dict], config: dict) -> str:
         "Local Prefilter Score", "LLM Topic Fit Score", "LLM Philosophical Depth Score", "LLM Relevance Score", "Freshness Score",
         "Traction Score", "Engagement Rate Score", "Quote Style", "Quote Style Reason", "Quote Docked To Zero", "Composite Score", "LLM Reason",
     ]
-    ws.append_row(headers, value_input_option="RAW")
+    _gsheets_call_with_retry("append header row", ws.append_row, headers, value_input_option="RAW")
 
     rows = []
     for i, tweet in enumerate(tweets, 1):
@@ -1735,7 +1797,7 @@ def export_to_gsheets(tweets: list[dict], config: dict) -> str:
         ])
 
     if rows:
-        ws.append_rows(rows, value_input_option="RAW")
+        _gsheets_call_with_retry("append tweet rows", ws.append_rows, rows, value_input_option="RAW")
 
     sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit#gid={ws.id}"
     print(f"   📊 Ranked sheet: {len(tweets)} tweets → {sheet_url}")
